@@ -15,8 +15,8 @@ V1 is intentionally narrow:
 - supported apps: Claude Code and Codex
 - supported workflow: list providers, show current provider, switch provider,
   export a Claude provider, and run local diagnostics
-- UI: `completing-read`, so Vertico, Ivy, Helm, and similar completion UIs work
-  naturally
+- UI: a `tabulated-list-mode` dashboard with a `transient` command menu, plus
+  `completing-read` fallback commands
 - storage: existing `~/.cc-switch/cc-switch.db`
 
 It does not implement provider CRUD, proxy/daemon takeover, MCP, prompts,
@@ -27,6 +27,7 @@ legacy `config.json`.
 
 - Emacs 29.1 or newer
 - built-in `sqlite` and `json`
+- `transient`
 - existing cc-switch SQLite database at `~/.cc-switch/cc-switch.db`, or at
   `$CC_SWITCH_CONFIG_DIR/cc-switch.db`
 - Codex switching additionally requires `toml.el`
@@ -48,6 +49,7 @@ Claude commands continue to work when `toml.el` is unavailable.
 
 ## Commands
 
+- `M-x cc-switch`
 - `M-x cc-switch-provider-list`
 - `M-x cc-switch-provider-current`
 - `M-x cc-switch-provider-switch`
@@ -57,13 +59,26 @@ Claude commands continue to work when `toml.el` is unavailable.
 - `M-x cc-switch-provider-export`
 - `M-x cc-switch-diagnose`
 
-Most commands use `cc-switch-default-app` unless called with a prefix argument,
-which prompts for `claude` or `codex`.
+Generic commands prompt for `claude` or `codex` every time.  Use
+`cc-switch-switch-claude` or `cc-switch-switch-codex` when you want a fixed-app
+shortcut.
+
+`M-x cc-switch` opens the dashboard.  In the dashboard:
+
+- `?` opens the transient menu
+- `g` refreshes
+- `RET` shows secret-safe provider details
+- `s` switches to the provider at point
+- `S` chooses an app and provider to switch
+- `e` exports the Claude provider at point
+- `d` opens diagnostics
+- `o` opens the live config file
+- `b` opens the single-file backup when it exists
+- `q` quits the window
 
 ## Configuration
 
 ```elisp
-(setq cc-switch-default-app "claude")
 (setq cc-switch-config-dir "~/.cc-switch")
 (setq cc-switch-claude-config-dir "~/.claude")
 (setq cc-switch-codex-home "~/.codex")
@@ -93,28 +108,64 @@ Claude switching writes `settings.json`.  Codex switching writes `config.toml`;
 official Codex providers may also update `auth.json`, while third-party
 providers preserve existing `auth.json` to avoid clobbering ChatGPT OAuth state.
 
-## Future Plan
+## TODO
 
-- provider add/edit/duplicate/delete
-- MCP sync
-- prompt management
-- skills management
-- proxy/daemon status integration and safe hot-switch
-- richer Codex auth handling and official OAuth helpers
-- Gemini, OpenCode, Hermes, and OpenClaw support
-- legacy `config.json` read-only import or migration helper
-- richer UI through `tabulated-list` or `transient`
+### P0: correctness and safety
+
+- Make Codex common-config handling structural instead of textual prepend, so
+  duplicate TOML keys and nested `model_provider` / `model_providers` tables are
+  merged predictably.
+- Add focused tests for rollback and atomic-write failure paths, including DB
+  update failure after live files have been written.
+- Add tests for Claude export, proxy-block refusal, official Codex `auth.json`
+  write/delete behavior, and diagnostics around missing or legacy config state.
+- Decide whether `toml.el` should remain an optional Codex-only dependency or be
+  declared as a package dependency for simpler installation.
+
+### P1: cc-switch feature parity
+
+- Provider CRUD: add, edit, duplicate, delete, reorder, and endpoint management.
+- Proxy/daemon integration: show daemon status, understand takeover state, and
+  support a safe hot-switch path when cc-switch proxy management is active.
+- MCP sync.
+- Prompt management.
+- Skills management.
+- WebDAV sync.
+- Speed tests and stream checks.
+
+### P2: broader app and auth support
+
+- Gemini, OpenCode, Hermes, and OpenClaw provider switching.
+- Richer Codex auth handling, including official OAuth helpers and safer
+  migration between ChatGPT OAuth and third-party API-key providers.
+- Legacy `config.json` read-only import or migration helper.
+
+### P3: UI and release polish
+
+- Further dashboard polish, including richer grouping, filtering, and optional
+  provider CRUD actions once the write paths are implemented.
+- Package metadata and release workflow, including package-lint/checkdoc cleanup.
+- User-facing recovery command for restoring `.<filename>.cc-switch-el.bak`
+  backups.
 
 ## Development
+
+Use the Makefile targets:
+
+```bash
+make compile
+make test-unit
+make coverage
+```
 
 Run tests:
 
 ```bash
-emacs --batch -L . -l cc-switch.el -l test/cc-switch-test.el -f ert-run-tests-batch-and-exit
+make test
 ```
 
 Byte-compile:
 
 ```bash
-emacs --batch -L . -f batch-byte-compile cc-switch.el
+make compile
 ```

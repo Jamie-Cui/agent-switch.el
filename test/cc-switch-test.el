@@ -79,9 +79,12 @@
   (declare (indent 1))
   `(let ((cc-switch-config-dir (expand-file-name "cc-switch" ,root))
          (cc-switch-claude-config-dir (expand-file-name ".claude" ,root))
-         (cc-switch-codex-home (expand-file-name ".codex" ,root))
-         (cc-switch-default-app "claude"))
+         (cc-switch-codex-home (expand-file-name ".codex" ,root)))
      ,@body))
+
+(ert-deftest cc-switch-app-is-explicit ()
+  (should-error (cc-switch-provider-current nil) :type 'cc-switch-error)
+  (should-error (cc-switch-provider-switch nil "provider") :type 'cc-switch-error))
 
 (ert-deftest cc-switch-providers-are-sorted-and-current-is-read ()
   (cc-switch-test--with-temp-root root
@@ -98,6 +101,52 @@
                              (cc-switch--providers "claude"))
                      '("a" "b")))
       (should (equal (cc-switch-provider-current "claude") "a")))))
+
+(ert-deftest cc-switch-dashboard-lists-supported-apps-with-row-context ()
+  (cc-switch-test--with-temp-root root
+    (cc-switch-test--with-env root
+      (let ((codex-settings
+             (cc-switch-test--hash "auth" (cc-switch-test--hash)
+                                   "config" "model = \"gpt\"\n")))
+        (cc-switch-test--write-db
+         (cc-switch--db-path)
+         (list
+          (list :id "claude-a" :app "claude" :name "Claude A"
+                :settings "{}" :category "official" :current t)
+          (list :id "codex-a" :app "codex" :name "Codex A"
+                :settings (cc-switch-test--json codex-settings)
+                :category "official" :current t))))
+      (with-temp-buffer
+        (cc-switch-mode)
+        (cc-switch-refresh)
+        (should (equal (mapcar #'car tabulated-list-entries)
+                       '(("claude" . "claude-a")
+                         ("codex" . "codex-a"))))
+        (should (equal (cc-switch--provider-reference-at-point)
+                       '("claude" . "claude-a")))
+        (should-not
+         (cl-some (lambda (overlay)
+                    (eq (overlay-get overlay 'face)
+                        'tabulated-list-fake-header))
+                  (overlays-in (point-min) (point-max))))))))
+
+(ert-deftest cc-switch-provider-details-hide-settings-config ()
+  (cc-switch-test--with-temp-root root
+    (cc-switch-test--with-env root
+      (let ((settings (cc-switch-test--hash
+                       "env" (cc-switch-test--hash
+                              "ANTHROPIC_AUTH_TOKEN" "secret-token"))))
+        (cc-switch-test--write-db
+         (cc-switch--db-path)
+         (list (list :id "p" :app "claude" :name "Provider"
+                     :settings (cc-switch-test--json settings)
+                     :current t))))
+      (let* ((provider (cc-switch--provider-by-id "claude" "p"))
+             (details (string-join
+                       (cc-switch--provider-details-lines "claude" provider)
+                       "\n")))
+        (should (string-match-p "Hidden: settings_config" details))
+        (should-not (string-match-p "secret-token" details))))))
 
 (ert-deftest cc-switch-switch-claude-writes-live-and-updates-db ()
   (cc-switch-test--with-temp-root root

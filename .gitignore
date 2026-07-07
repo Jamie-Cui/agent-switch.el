@@ -10,8 +10,13 @@
 # Built distribution
 dist/
 
+# Test coverage
+coverage/
+
 # Backup files
 *~
 
 # Undo-tree save-files
 *.~undo-tree
+/cc-switch-autoloads.el
+/cc-switch-pkg.el

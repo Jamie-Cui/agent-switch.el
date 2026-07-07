@@ -4,7 +4,7 @@
 
 ;; Author: Jamie
 ;; Keywords: tools, convenience
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.1") (transient "0.4"))
 ;; Version: 0.1.0
 ;; URL: https://github.com/jamie/cc-switch.el
 
@@ -27,6 +27,11 @@
 (require 'json)
 (require 'sqlite)
 (require 'subr-x)
+(require 'tabulated-list)
+(require 'transient)
+
+(declare-function evil-make-overriding-map "evil-core")
+(declare-function evil-normalize-keymaps "evil-core")
 
 (defgroup cc-switch nil
   "Switch cc-switch providers from Emacs."
@@ -38,11 +43,6 @@
 When nil, use `CC_SWITCH_CONFIG_DIR' or ~/.cc-switch."
   :type '(choice (const :tag "Auto" nil) directory))
 
-(defcustom cc-switch-default-app "claude"
-  "Default app for cc-switch commands.
-Supported values are \"claude\" and \"codex\"."
-  :type '(choice (const "claude") (const "codex")))
-
 (defcustom cc-switch-claude-config-dir nil
   "Claude Code config directory.
 When nil, use `CLAUDE_CONFIG_DIR' or ~/.claude."
@@ -53,6 +53,10 @@ When nil, use `CLAUDE_CONFIG_DIR' or ~/.claude."
 When nil, use `CODEX_HOME' if it names an existing directory, otherwise
 use ~/.codex."
   :type '(choice (const :tag "Auto" nil) directory))
+
+(defcustom cc-switch-buffer-name "*cc-switch*"
+  "Name of the cc-switch dashboard buffer."
+  :type 'string)
 
 (define-error 'cc-switch-error "cc-switch error")
 
@@ -118,23 +122,23 @@ use ~/.codex."
 (defun cc-switch--normalize-app (app)
   "Return normalized APP string or signal an error."
   (let ((value (cond
+                ((null app) nil)
                 ((symbolp app) (symbol-name app))
                 ((stringp app) app)
-                ((null app) cc-switch-default-app)
                 (t (format "%s" app)))))
+    (unless value
+      (signal 'cc-switch-error
+              (list "App is required; expected claude or codex")))
     (setq value (downcase (string-trim value)))
     (unless (member value cc-switch--supported-apps)
       (signal 'cc-switch-error
               (list (format "Unsupported app %S; expected claude or codex" app))))
     value))
 
-(defun cc-switch--read-app (ask)
-  "Read app when ASK is non-nil, otherwise return the default app."
+(defun cc-switch--read-app ()
+  "Read app explicitly."
   (cc-switch--normalize-app
-   (if ask
-       (completing-read "App: " cc-switch--supported-apps nil t
-                        nil nil cc-switch-default-app)
-     cc-switch-default-app)))
+   (completing-read "App: " cc-switch--supported-apps nil t)))
 
 (defun cc-switch--parse-json (text &optional context)
   "Parse JSON TEXT into hash-table based values.
@@ -622,8 +626,8 @@ path valid without attempting to preserve arbitrary duplicate TOML keys."
 ;;;###autoload
 (defun cc-switch-provider-list (&optional app)
   "Show providers for APP.
-Interactively, a prefix argument prompts for APP."
-  (interactive (list (cc-switch--read-app current-prefix-arg)))
+Interactively, prompt for APP."
+  (interactive (list (cc-switch--read-app)))
   (setq app (cc-switch--normalize-app app))
   (let ((providers (cc-switch--providers app)))
     (with-current-buffer (get-buffer-create "*cc-switch providers*")
@@ -639,8 +643,8 @@ Interactively, a prefix argument prompts for APP."
 ;;;###autoload
 (defun cc-switch-provider-current (&optional app)
   "Show current provider for APP.
-Interactively, a prefix argument prompts for APP."
-  (interactive (list (cc-switch--read-app current-prefix-arg)))
+Interactively, prompt for APP."
+  (interactive (list (cc-switch--read-app)))
   (setq app (cc-switch--normalize-app app))
   (let ((provider-id (cc-switch--current-provider-id app)))
     (if (called-interactively-p 'interactive)
@@ -650,9 +654,9 @@ Interactively, a prefix argument prompts for APP."
 ;;;###autoload
 (defun cc-switch-provider-switch (&optional app provider-id)
   "Switch APP to PROVIDER-ID.
-Interactively, a prefix argument prompts for APP."
+Interactively, prompt for APP and PROVIDER-ID."
   (interactive
-   (let* ((app (cc-switch--read-app current-prefix-arg))
+   (let* ((app (cc-switch--read-app))
           (provider-id (cc-switch--read-provider-id app "Switch to provider: ")))
      (list app provider-id)))
   (let ((provider (cc-switch--switch-provider app provider-id)))
@@ -760,6 +764,518 @@ argument is used, in which case read the output path."
             (special-mode))
           (display-buffer (current-buffer)))
       text)))
+
+;;; Dashboard UI
+
+(defvar-local cc-switch--dashboard-error nil
+  "Last dashboard refresh error for the current buffer.")
+
+(defun cc-switch--display-value (value &optional fallback)
+  "Return VALUE as a non-empty display string, or FALLBACK."
+  (let ((text (cond
+               ((null value) nil)
+               ((stringp value) (string-trim value))
+               (t (format "%s" value)))))
+    (if (and text (not (string-empty-p text)))
+        text
+      (or fallback "-"))))
+
+(defun cc-switch--bool-label (value)
+  "Return yes or no for VALUE."
+  (if value "yes" "no"))
+
+(defun cc-switch--ok-label (value)
+  "Return an ok/missing status label for VALUE."
+  (if value
+      (propertize "ok" 'face 'success)
+    (propertize "missing" 'face 'warning)))
+
+(defun cc-switch--short-path (path)
+  "Return PATH abbreviated for dashboard display."
+  (abbreviate-file-name path))
+
+(defun cc-switch--status-field (label value &optional width)
+  "Return a dashboard status field with LABEL and VALUE.
+When WIDTH is non-nil, right-pad the result to WIDTH."
+  (let ((text (format "%s %s"
+                      (propertize label 'face 'shadow)
+                      value)))
+    (if width
+        (format (format "%%-%ds" width) text)
+      text)))
+
+(defun cc-switch--dashboard-status-row (name current live proxy &optional extra)
+  "Return a compact dashboard status row.
+NAME is the app or resource name.  CURRENT is the current provider or
+resource path.  LIVE is the primary live path or status.  PROXY is the
+proxy or access status.  EXTRA is optional trailing status text."
+  (format "  %-8s current %-18s config %-30s %-12s %s"
+          name
+          current
+          live
+          proxy
+          (or extra "")))
+
+(defun cc-switch--truncate-cell (value width &optional fallback)
+  "Return VALUE as a table cell no wider than WIDTH.
+FALLBACK is used for empty values.  The full value is kept in
+`help-echo' when truncation happens."
+  (let ((text (cc-switch--display-value value fallback)))
+    (if (> (string-width text) width)
+        (propertize
+         (truncate-string-to-width text width nil nil "...")
+         'help-echo text)
+      text)))
+
+(defun cc-switch--dashboard-live-path (app)
+  "Return APP primary live config path."
+  (pcase app
+    ("claude" (cc-switch--claude-settings-path))
+    ("codex" (cc-switch--codex-config-path))))
+
+(defun cc-switch--dashboard-live-dir (app)
+  "Return APP live config directory."
+  (pcase app
+    ("claude" (cc-switch--claude-config-dir))
+    ("codex" (cc-switch--codex-home))))
+
+(defun cc-switch--safe-current-provider-id (app)
+  "Return APP current provider id as display text."
+  (condition-case err
+      (or (cc-switch--current-provider-id app) "<none>")
+    (error (format "error: %s" (error-message-string err)))))
+
+(defun cc-switch--safe-proxy-status (app)
+  "Return APP proxy status as display text."
+  (condition-case err
+      (or (cc-switch--proxy-blocking-reason app) "no")
+    (error (format "error: %s" (error-message-string err)))))
+
+(defun cc-switch--dashboard-db-status-line ()
+  "Return the dashboard database status line."
+  (let ((db-path (cc-switch--db-path))
+        (legacy-path (cc-switch--legacy-config-path)))
+    (format "  %-8s %-32s %-12s %-18s %s"
+            "DB"
+            (cc-switch--short-path db-path)
+            (format "exists %s" (cc-switch--ok-label (file-exists-p db-path)))
+            (format "access %s"
+                    (if (and (file-readable-p db-path)
+                             (file-writable-p db-path))
+                        (propertize "ok" 'face 'success)
+                      (propertize "limited" 'face 'warning)))
+            (format "legacy %s" (cc-switch--bool-label (file-exists-p legacy-path))))))
+
+(defun cc-switch--dashboard-app-status-line (app)
+  "Return a dashboard status line for APP."
+  (let* ((live-dir (cc-switch--dashboard-live-dir app))
+         (live-path (cc-switch--dashboard-live-path app))
+         (proxy (cc-switch--safe-proxy-status app))
+         (codex-extra
+          (and (string-equal app "codex")
+               (format "toml %s"
+                       (cc-switch--ok-label (require 'toml nil t))))))
+    (cc-switch--dashboard-status-row
+     (capitalize app)
+     (cc-switch--safe-current-provider-id app)
+     (cc-switch--short-path live-path)
+     (if (string-equal proxy "no")
+         (propertize "proxy ok" 'face 'success)
+       (propertize proxy 'face 'warning))
+     (string-join
+      (delq nil
+            (list (format "dir %s"
+                          (cc-switch--ok-label (file-directory-p live-dir)))
+                  codex-extra))
+      ", "))))
+
+(defun cc-switch--dashboard-status-lines ()
+  "Return dashboard preamble lines."
+  (append
+   (list (propertize "cc-switch" 'face 'bold)
+         (propertize
+          "[?] menu   [g] refresh   [RET] details   [s] switch   [e] export   [q] quit"
+          'face 'shadow)
+         ""
+         (propertize "Status" 'face 'bold)
+         (cc-switch--dashboard-db-status-line))
+   (mapcar #'cc-switch--dashboard-app-status-line cc-switch--supported-apps)
+   (when cc-switch--dashboard-error
+     (list (propertize
+            (format "Refresh error: %s" cc-switch--dashboard-error)
+            'face 'error)))
+   (list ""
+         (propertize "Providers" 'face 'bold))))
+
+(defun cc-switch--dashboard-insert-status ()
+  "Insert dashboard status lines at the top of the current buffer."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char (point-min))
+      (dolist (line (cc-switch--dashboard-status-lines))
+        (insert line "\n"))
+      (insert "\n"))))
+
+(defun cc-switch--remove-fake-header-overlays ()
+  "Remove `tabulated-list' fake header overlays from the dashboard.
+Those overlays can inherit underline-heavy theme styling and, after the
+dashboard preamble is inserted, may visually affect more than the table
+header."
+  (remove-overlays (point-min) (point-max)
+                   'face 'tabulated-list-fake-header))
+
+(defun cc-switch--dashboard-entry (provider)
+  "Return a tabulated-list entry for PROVIDER."
+  (let* ((app (cc-switch--provider-app provider))
+         (provider-id (cc-switch--provider-id provider))
+         (current (cc-switch--provider-current provider))
+         (snippet (condition-case nil
+                      (cc-switch--common-config-snippet app)
+                    (error nil)))
+         (proxy (cc-switch--safe-proxy-status app))
+         (name (cc-switch--truncate-cell
+                (cc-switch--provider-name provider) 30))
+         (category (cc-switch--truncate-cell
+                    (cc-switch--provider-category provider) 12))
+         (id-cell (cc-switch--truncate-cell provider-id 22))
+         (current-cell (if current
+                           (propertize "*" 'face 'success)
+                         ""))
+         (tags
+          (delq nil
+                (list
+                 (and (cc-switch--provider-uses-common-config-p provider snippet)
+                      (propertize "common" 'face 'font-lock-constant-face))
+                 (and (not (string-equal proxy "no"))
+                      (propertize "proxy-blocked" 'face 'warning))
+                 (and (string-equal app "codex")
+                      (cc-switch--codex-official-provider-p provider)
+                      (propertize "auth" 'face 'font-lock-keyword-face)))))
+         (tag-cell (string-join tags " ")))
+    (list (cons app provider-id)
+          (vector current-cell
+                  app
+                  (if current (propertize name 'face 'bold) name)
+                  id-cell
+                  category
+                  tag-cell))))
+
+(defun cc-switch--dashboard-entries ()
+  "Return all provider entries for the dashboard."
+  (setq cc-switch--dashboard-error nil)
+  (condition-case err
+      (mapcan (lambda (app)
+                (mapcar #'cc-switch--dashboard-entry
+                        (cc-switch--providers app)))
+              cc-switch--supported-apps)
+    (error
+     (setq cc-switch--dashboard-error (error-message-string err))
+     nil)))
+
+(defun cc-switch--setup-tabulated-list ()
+  "Install cc-switch dashboard table settings in the current buffer."
+  (setq tabulated-list-format
+        [("Cur" 3 nil)
+         ("App" 8 nil)
+         ("Provider" 30 nil)
+         ("ID" 22 nil)
+         ("Kind" 12 nil)
+         ("Tags" 24 nil)])
+  (setq tabulated-list-use-header-line nil)
+  (setq tabulated-list-padding 2)
+  (setq tabulated-list-sort-key nil)
+  (tabulated-list-init-header))
+
+(defun cc-switch--goto-first-dashboard-entry ()
+  "Move point to the first provider row when possible."
+  (goto-char (point-min))
+  (while (and (not (eobp))
+              (not (tabulated-list-get-id)))
+    (forward-line 1)))
+
+(defun cc-switch-refresh ()
+  "Refresh the current cc-switch dashboard."
+  (interactive)
+  (unless (derived-mode-p 'cc-switch-mode)
+    (user-error "Not in a cc-switch dashboard buffer"))
+  (cc-switch--setup-tabulated-list)
+  (setq tabulated-list-entries (cc-switch--dashboard-entries))
+  (tabulated-list-print t)
+  (cc-switch--dashboard-insert-status)
+  (cc-switch--remove-fake-header-overlays)
+  (unless (tabulated-list-get-id)
+    (cc-switch--goto-first-dashboard-entry)))
+
+(defun cc-switch--refresh-dashboard-buffers ()
+  "Refresh all open cc-switch dashboard buffers."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'cc-switch-mode)
+        (cc-switch-refresh)))))
+
+(defun cc-switch--provider-reference-at-point (&optional noerror)
+  "Return the provider reference at point as (APP . PROVIDER-ID).
+When NOERROR is non-nil, return nil instead of signaling."
+  (let ((id (and (derived-mode-p 'cc-switch-mode)
+                 (tabulated-list-get-id))))
+    (if (and (consp id)
+             (member (car id) cc-switch--supported-apps)
+             (stringp (cdr id)))
+        id
+      (unless noerror
+        (user-error "No provider row at point")))))
+
+(defun cc-switch--read-provider-reference (&optional prompt)
+  "Read a provider reference, or use the provider row at point.
+PROMPT is used for provider selection when no row is available."
+  (or (cc-switch--provider-reference-at-point t)
+      (let* ((app (cc-switch--read-app))
+             (provider-id (cc-switch--read-provider-id app prompt)))
+        (cons app provider-id))))
+
+(defun cc-switch--show-text-buffer (buffer-name lines)
+  "Show BUFFER-NAME containing LINES in `special-mode'."
+  (with-current-buffer (get-buffer-create buffer-name)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (dolist (line lines)
+        (insert line "\n"))
+      (special-mode))
+    (display-buffer (current-buffer))))
+
+(defun cc-switch--provider-details-lines (app provider)
+  "Return secret-safe detail lines for APP PROVIDER."
+  (let* ((snippet (condition-case nil
+                      (cc-switch--common-config-snippet app)
+                    (error nil)))
+         (paths (cc-switch--live-paths-for-switch app provider))
+         (notes (cc-switch--display-value
+                 (cc-switch--provider-notes provider) ""))
+         (lines
+          (list
+           "Provider"
+           ""
+           (format "App: %s" app)
+           (format "Name: %s" (cc-switch--provider-name provider))
+           (format "ID: %s" (cc-switch--provider-id provider))
+           (format "Category: %s"
+                   (cc-switch--display-value
+                    (cc-switch--provider-category provider)))
+           (format "Website: %s"
+                   (cc-switch--display-value
+                    (cc-switch--provider-website-url provider)))
+           (format "Current: %s"
+                   (cc-switch--bool-label
+                    (cc-switch--provider-current provider)))
+           (format "Failover queue: %s"
+                   (cc-switch--bool-label
+                    (cc-switch--provider-in-failover-queue provider)))
+           (format "Sort index: %s"
+                   (cc-switch--display-value
+                    (cc-switch--provider-sort-index provider)))
+           (format "Common config: %s"
+                   (cc-switch--bool-label
+                    (cc-switch--provider-uses-common-config-p
+                     provider snippet)))
+           (format "Codex official: %s"
+                   (if (string-equal app "codex")
+                       (cc-switch--bool-label
+                        (cc-switch--codex-official-provider-p provider))
+                     "-"))
+           ""
+           "Writes:")))
+    (setq lines
+          (append lines
+                  (mapcar (lambda (path) (format "- %s" path)) paths)
+                  (list ""
+                        "Hidden: settings_config, auth fields, API keys, and tokens")))
+    (when (not (string-empty-p notes))
+      (setq lines
+            (append lines
+                    (list ""
+                          "Notes:"
+                          notes))))
+    lines))
+
+(defun cc-switch-provider-details ()
+  "Show secret-safe details for the provider at point or a chosen provider."
+  (interactive)
+  (let* ((ref (cc-switch--read-provider-reference "Show provider: "))
+         (app (car ref))
+         (provider-id (cdr ref))
+         (provider (cc-switch--provider-by-id app provider-id)))
+    (cc-switch--show-text-buffer
+     "*cc-switch provider*"
+     (cc-switch--provider-details-lines app provider))))
+
+(defun cc-switch--confirm-risky-switch (app provider)
+  "Ask for confirmation before risky APP PROVIDER switches."
+  (when (and (string-equal app "codex")
+             (cc-switch--codex-official-provider-p provider)
+             (not (yes-or-no-p
+                   (format "Switching to official Codex provider %s may update auth.json. Continue? "
+                           (cc-switch--provider-name provider)))))
+    (user-error "Cancelled")))
+
+(defun cc-switch--switch-provider-from-ui (app provider-id)
+  "Switch APP to PROVIDER-ID from dashboard-style UI."
+  (setq app (cc-switch--normalize-app app))
+  (let ((provider (cc-switch--provider-by-id app provider-id)))
+    (if (cc-switch--provider-current provider)
+        (message "%s already uses %s [%s]"
+                 app
+                 (cc-switch--provider-name provider)
+                 provider-id)
+      (cc-switch--confirm-risky-switch app provider)
+      (setq provider (cc-switch--switch-provider app provider-id))
+      (cc-switch--refresh-dashboard-buffers)
+      (message "Switched %s to %s [%s]"
+               app
+               (cc-switch--provider-name provider)
+               provider-id))
+    provider))
+
+(defun cc-switch-switch-provider-at-point ()
+  "Switch to the provider on the current dashboard row."
+  (interactive)
+  (let ((ref (cc-switch--provider-reference-at-point)))
+    (cc-switch--switch-provider-from-ui (car ref) (cdr ref))))
+
+(defun cc-switch-switch-provider ()
+  "Choose an app and provider, then switch using dashboard semantics."
+  (interactive)
+  (let* ((app (cc-switch--read-app))
+         (provider-id (cc-switch--read-provider-id app "Switch to provider: ")))
+    (cc-switch--switch-provider-from-ui app provider-id)))
+
+(defun cc-switch-switch-claude-provider ()
+  "Choose a Claude provider, then switch using dashboard semantics."
+  (interactive)
+  (cc-switch--switch-provider-from-ui
+   "claude"
+   (cc-switch--read-provider-id "claude" "Switch Claude to: ")))
+
+(defun cc-switch-switch-codex-provider ()
+  "Choose a Codex provider, then switch using dashboard semantics."
+  (interactive)
+  (cc-switch--switch-provider-from-ui
+   "codex"
+   (cc-switch--read-provider-id "codex" "Switch Codex to: ")))
+
+(defun cc-switch-export-provider-at-point (&optional output)
+  "Export the Claude provider at point to OUTPUT.
+Interactively, export to ./.claude/settings.local.json unless a prefix
+argument is used, in which case read the output path."
+  (interactive
+   (let* ((ref (cc-switch--provider-reference-at-point))
+          (default (expand-file-name ".claude/settings.local.json"
+                                     default-directory))
+          (output (if current-prefix-arg
+                      (read-file-name "Export to: "
+                                      (file-name-directory default)
+                                      default nil
+                                      (file-name-nondirectory default))
+                    default)))
+     (unless (string-equal (car ref) "claude")
+       (user-error "Only Claude providers can be exported"))
+     (list output)))
+  (let* ((ref (cc-switch--provider-reference-at-point))
+         (app (car ref))
+         (provider-id (cdr ref)))
+    (unless (string-equal app "claude")
+      (user-error "Only Claude providers can be exported"))
+    (setq output
+          (or output
+              (expand-file-name ".claude/settings.local.json"
+                                default-directory)))
+    (cc-switch-provider-export provider-id output)
+    (message "Exported Claude provider %s to %s" provider-id output)
+    output))
+
+(defun cc-switch-open-live-config ()
+  "Open the live config file for the provider row at point or a chosen app."
+  (interactive)
+  (let* ((ref (or (cc-switch--provider-reference-at-point t)
+                  (cons (cc-switch--read-app) nil)))
+         (path (cc-switch--dashboard-live-path (car ref))))
+    (find-file path)))
+
+(defun cc-switch-open-backup ()
+  "Open the single-file backup for the provider row at point or a chosen app."
+  (interactive)
+  (let* ((ref (or (cc-switch--provider-reference-at-point t)
+                  (cons (cc-switch--read-app) nil)))
+         (path (cc-switch--backup-path
+                (cc-switch--dashboard-live-path (car ref)))))
+    (unless (file-exists-p path)
+      (user-error "Backup does not exist: %s" path))
+    (find-file path)))
+
+(transient-define-prefix cc-switch-menu ()
+  "cc-switch command menu."
+  ["View"
+   [("g" "Refresh" cc-switch-refresh)
+    ("RET" "Provider details" cc-switch-provider-details)
+    ("d" "Diagnose" cc-switch-diagnose)]]
+  ["Switch"
+   [("s" "Switch row" cc-switch-switch-provider-at-point)
+    ("S" "Choose provider" cc-switch-switch-provider)
+    ("c" "Claude provider" cc-switch-switch-claude-provider)
+    ("x" "Codex provider" cc-switch-switch-codex-provider)]]
+  ["Export"
+   [("e" "Export row" cc-switch-export-provider-at-point)
+    ("E" "Choose Claude export" cc-switch-provider-export)]]
+  ["Files"
+   [("o" "Open live config" cc-switch-open-live-config)
+    ("b" "Open backup" cc-switch-open-backup)]])
+
+(defvar cc-switch-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map tabulated-list-mode-map)
+    (define-key map (kbd "?") #'cc-switch-menu)
+    (define-key map (kbd "g") #'cc-switch-refresh)
+    (define-key map (kbd "RET") #'cc-switch-provider-details)
+    (define-key map (kbd "s") #'cc-switch-switch-provider-at-point)
+    (define-key map (kbd "S") #'cc-switch-switch-provider)
+    (define-key map (kbd "e") #'cc-switch-export-provider-at-point)
+    (define-key map (kbd "d") #'cc-switch-diagnose)
+    (define-key map (kbd "o") #'cc-switch-open-live-config)
+    (define-key map (kbd "b") #'cc-switch-open-backup)
+    (define-key map (kbd "q") #'quit-window)
+    map)
+  "Keymap for `cc-switch-mode'.")
+
+(defvar cc-switch-mode-syntax-table
+  (make-syntax-table)
+  "Syntax table for `cc-switch-mode'.")
+
+(defun cc-switch--evil-normalize-keymaps ()
+  "Refresh Evil keymaps for `cc-switch-mode'."
+  (when (fboundp 'evil-normalize-keymaps)
+    (evil-normalize-keymaps)))
+
+(with-eval-after-load 'evil
+  (when (fboundp 'evil-make-overriding-map)
+    (evil-make-overriding-map cc-switch-mode-map 'normal))
+  (add-hook 'cc-switch-mode-hook #'cc-switch--evil-normalize-keymaps))
+
+(define-derived-mode cc-switch-mode tabulated-list-mode "cc-switch"
+  "Major mode for the cc-switch dashboard."
+  (cc-switch--setup-tabulated-list)
+  (setq-local revert-buffer-function
+              (lambda (_ignore-auto _noconfirm)
+                (cc-switch-refresh))))
+
+;;;###autoload
+(defun cc-switch ()
+  "Open the cc-switch dashboard."
+  (interactive)
+  (let ((buffer (get-buffer-create cc-switch-buffer-name)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'cc-switch-mode)
+        (cc-switch-mode))
+      (cc-switch-refresh))
+    (pop-to-buffer buffer)))
 
 (provide 'cc-switch)
 
