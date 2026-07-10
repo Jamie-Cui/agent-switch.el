@@ -24,7 +24,7 @@
 
 (cl-defstruct (agent-switch-adapter
                (:constructor agent-switch--make-adapter))
-  id name callbacks profile-fields editor)
+  id name callbacks)
 
 (cl-defstruct (agent-switch-client
                (:constructor agent-switch--make-client))
@@ -60,7 +60,7 @@
 (defconst agent-switch--callback-keys
   '(:current :activate :validate :discover :status :snapshot :rollback
     :profile-current-p :capture-current :describe :watch-paths :watch-setup
-    :edit-profile :delete-profile)
+    :profile-template)
   "Recognized adapter callback keys.")
 
 (defun agent-switch--string-id (value kind)
@@ -109,8 +109,7 @@ Signal when REQUIRED is non-nil and the callback is absent."
   "Register an adapter ID using PROPERTIES.
 
 Required callback properties are `:current' and `:activate'.  Optional
-callbacks are listed in `agent-switch--callback-keys'.  `:profile-fields'
-contains a declarative editor schema and `:editor' may name a custom editor."
+callbacks are listed in `agent-switch--callback-keys'."
   (setq id (agent-switch--string-id id "adapter"))
   (let (callbacks)
     (dolist (key agent-switch--callback-keys)
@@ -129,9 +128,7 @@ contains a declarative editor schema and `:editor' may name a custom editor."
            (agent-switch--make-adapter
             :id id
             :name (or (plist-get properties :name) id)
-            :callbacks callbacks
-            :profile-fields (plist-get properties :profile-fields)
-            :editor (plist-get properties :editor))))
+            :callbacks callbacks)))
       (puthash id adapter agent-switch--adapters)
       adapter)))
 
@@ -284,7 +281,8 @@ This is primarily useful to isolate tests and reload built-in adapters."
 (declare-function agent-switch-profiles "agent-switch-storage" (client-id))
 (declare-function agent-switch-resolve-profile-secrets "agent-switch-storage" (profile))
 (declare-function agent-switch-state-last-selected "agent-switch-storage" (client-id))
-(declare-function agent-switch-state-set-last-selected "agent-switch-storage" (client-id profile-id))
+(declare-function agent-switch-state-set-last-selected "agent-switch-storage"
+                  (client-id profile-id &optional profile))
 (declare-function agent-switch-state-unprotected-confirmed-p "agent-switch-storage" (adapter-id))
 (declare-function agent-switch-state-confirm-unprotected "agent-switch-storage" (adapter-id))
 
@@ -378,7 +376,8 @@ INTERACTIVEP is recorded in the adapter context."
                    (progn
                      (agent-switch-state-set-last-selected
                       (agent-switch-client-id client)
-                      (agent-switch-profile-id profile))
+                      (agent-switch-profile-id profile)
+                      profile)
                      (funcall resolve profile))
                  (error (roll-back "state commit" error-value))))
               (verify

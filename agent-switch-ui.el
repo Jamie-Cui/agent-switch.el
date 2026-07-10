@@ -15,7 +15,6 @@
 (require 'seq)
 (require 'subr-x)
 (require 'transient)
-(require 'wid-edit)
 (require 'agent-switch-core)
 (require 'agent-switch-storage)
 
@@ -152,13 +151,6 @@
   "Set section ID visibility to VISIBLE."
   (puthash id (and visible t) agent-switch--visibility))
 
-(defun agent-switch--section-indicator (expanded)
-  "Return a compact visibility indicator for EXPANDED."
-  (if (and (char-displayable-p ?\u25b8)
-           (char-displayable-p ?\u25be))
-      (if expanded "▾" "▸")
-    (if expanded "-" "+")))
-
 (defun agent-switch--insert-section-heading
     (id type parent label &optional value face)
   "Insert a section heading and register it.
@@ -166,11 +158,9 @@ ID, TYPE, and PARENT describe the section.  LABEL is displayed, VALUE is
 associated context, and FACE overrides the standard heading face."
   (let* ((expanded (agent-switch--visibility-value id type))
          (start (point))
-         (indicator (agent-switch--section-indicator expanded))
          (section (agent-switch--make-section
                    :id id :type type :parent parent :start start
                    :value value :expanded-p expanded)))
-    (insert (propertize indicator 'face 'shadow) " ")
     (let ((label-start (point)))
       (insert label)
       (add-face-text-property
@@ -324,10 +314,33 @@ Prefer the Profile named by LAST-SELECTED."
 
 (defun agent-switch--client-status (view)
   "Return propertized status string for client VIEW."
-  (let ((current-profile (agent-switch-client-view-current-profile view))
-        (last-selected (agent-switch-client-view-last-selected view))
-        (client-id (agent-switch-client-id
-                    (agent-switch-client-view-client view))))
+  (let* ((client (agent-switch-client-view-client view))
+         (client-id (agent-switch-client-id client))
+         (current (agent-switch-client-view-current view))
+         (current-profile (agent-switch-client-view-current-profile view))
+         (last-selected (agent-switch-client-view-last-selected view))
+         (last-profile
+          (and last-selected
+               (cl-find last-selected (agent-switch-client-view-profiles view)
+                        :key #'agent-switch-profile-id :test #'equal)))
+         (applied (agent-switch-state-applied-profile client-id))
+         (applied-fingerprint
+          (and (hash-table-p applied) (gethash "fingerprint" applied)))
+         (profile-changed
+          (and last-profile applied-fingerprint
+               (not (equal
+                     applied-fingerprint
+                     (agent-switch-profile-payload-fingerprint last-profile)))))
+         (live-matches-applied
+          (and current last-profile (hash-table-p applied)
+               (hash-table-p (gethash "payload" applied))
+               (let ((snapshot (copy-agent-switch-profile last-profile)))
+                 (setf (agent-switch-profile-payload snapshot)
+                       (gethash "payload" applied))
+                 (condition-case nil
+                     (agent-switch-profile-current-p
+                      client snapshot current nil)
+                   (error nil))))))
     (cond
      ((agent-switch--job-running-p client-id)
       (propertize "working" 'face 'agent-switch-status-warning))
@@ -335,17 +348,27 @@ Prefer the Profile named by LAST-SELECTED."
       (propertize "loading" 'face 'shadow))
      ((agent-switch-client-view-error view)
       (propertize "error" 'face 'agent-switch-status-error))
+     ((and last-profile (not (agent-switch-profile-valid-p last-profile)))
+      (concat (propertize "invalid profile, " 'face 'agent-switch-status-error)
+              (agent-switch-profile-name last-profile)))
      ((and current-profile
            (equal (agent-switch-profile-id current-profile) last-selected))
-      (concat "current "
+      (concat "current, "
               (propertize (agent-switch-profile-name current-profile)
                           'face 'agent-switch-current)))
      (current-profile
-      (concat (propertize "changed externally: "
+      (concat (propertize "external selection, "
                           'face 'agent-switch-status-warning)
               (agent-switch-profile-name current-profile)))
-     ((agent-switch-client-view-current view)
-      (propertize "changed externally" 'face 'agent-switch-status-warning))
+     ((and profile-changed live-matches-applied)
+      (concat (propertize "apply pending, "
+                          'face 'agent-switch-status-warning)
+              (agent-switch-profile-name last-profile)))
+     (profile-changed
+      (concat (propertize "conflict, " 'face 'agent-switch-status-error)
+              (agent-switch-profile-name last-profile)))
+     (current
+      (propertize "unmanaged live config" 'face 'agent-switch-status-warning))
      (t (propertize "not configured" 'face 'shadow)))))
 
 (defun agent-switch--insert-status-line (key value &optional value-face)
@@ -415,7 +438,7 @@ Prefer the Profile named by LAST-SELECTED."
          (id (agent-switch--section-id "client" client-id
                                        "profile" (agent-switch-profile-id profile)))
          (current-p (eq profile (agent-switch-client-view-current-profile view)))
-         (marker (if current-p "*" " "))
+         (marker (if current-p "  *" "   "))
          (name (agent-switch--display-width
                 (agent-switch-profile-name profile) 28))
          (profile-id (agent-switch--display-width
@@ -436,13 +459,9 @@ Prefer the Profile named by LAST-SELECTED."
   (let* ((client (agent-switch-client-view-client view))
          (client-id (agent-switch-client-id client))
          (id (agent-switch--section-id "client" client-id))
-         (name (propertize
-                (agent-switch--display-width
-                 (agent-switch-client-name client)
-                 (max 8 agent-switch-client-name-width))
-                'face 'agent-switch-section-heading))
-         (label (concat name
-                        "  " (agent-switch--client-status view)))
+         (name (propertize (agent-switch-client-name client)
+                           'face 'agent-switch-key))
+         (label (concat name " (" (agent-switch--client-status view) ")"))
          (section (agent-switch--insert-section-heading
                    id 'client nil label client 'default)))
     (when (agent-switch-section-expanded-p section)
@@ -789,19 +808,133 @@ Refresh immediately for direct values."
     (agent-switch--activate-profile
      client (agent-switch-find-profile client-id profile-id))))
 
-(defun agent-switch--open-captured-profile (client payload)
-  "Open a managed Profile form for CLIENT using captured PAYLOAD."
+(defun agent-switch--random-profile-id (client-id)
+  "Return an unused short random Profile ID for CLIENT-ID."
+  (let (candidate)
+    (while
+        (progn
+          (setq candidate
+                (concat
+                 "p-"
+                 (substring
+                  (secure-hash
+                   'sha256
+                   (format "%s:%s:%s:%s"
+                           client-id (float-time) (random) (emacs-pid)))
+                  0 8)))
+          (file-exists-p (agent-switch-profile-path client-id candidate))))
+    candidate))
+
+(defun agent-switch--read-profile-name (&optional default)
+  "Read a non-empty Profile name, using DEFAULT when supplied."
+  (let ((name (string-trim
+               (read-string "Profile name: " nil nil default))))
+    (when (string-empty-p name)
+      (user-error "Profile name is required"))
+    name))
+
+(defun agent-switch--new-profile-payload (client)
+  "Return a fresh payload template for CLIENT."
+  (let* ((adapter (agent-switch-get-adapter
+                   (agent-switch-client-adapter-id client)))
+         (template (agent-switch-adapter-callback adapter :profile-template))
+         (payload (if template
+                      (funcall template client nil)
+                    (make-hash-table :test #'equal))))
+    (unless (hash-table-p payload)
+      (signal 'agent-switch-validation-error
+              '("profile-template must return a JSON object")))
+    (agent-switch-json-copy payload)))
+
+(defun agent-switch--save-new-profile (client name payload)
+  "Create, save, and visit a managed Profile for CLIENT."
+  (let* ((client-id (agent-switch-client-id client))
+         (id (agent-switch--random-profile-id client-id))
+         (profile (agent-switch--make-profile
+                   :id id :client-id client-id :name name
+                   :description nil :payload payload
+                   :ownership 'managed :valid-p t)))
+    (agent-switch-save-profile profile)
+    (agent-switch-refresh-dashboards)
+    (find-file (agent-switch-profile-source profile))
+    profile))
+
+(defun agent-switch-profile-new ()
+  "Create and visit a new managed Profile for the Client at point."
+  (interactive)
+  (let ((client (or (agent-switch--client-at-point t)
+                    (agent-switch-get-client
+                     (completing-read
+                      "Client: "
+                      (mapcar #'agent-switch-client-id
+                              (agent-switch-clients))
+                      nil t)))))
+    (agent-switch--ensure-client-idle client)
+    (agent-switch--save-new-profile
+     client
+     (agent-switch--read-profile-name
+      (format "%s Profile" (agent-switch-client-name client)))
+     (agent-switch--new-profile-payload client))))
+
+(defun agent-switch--profile-at-point-noerror ()
+  "Return the Profile at point, or nil when point is not in one."
+  (condition-case nil
+      (agent-switch--profile-at-point)
+    (error nil)))
+
+(defun agent-switch--effective-profile-for-client (client)
+  "Return the managed Profile that Edit should open for CLIENT."
+  (let* ((client-id (agent-switch-client-id client))
+         (current-result (agent-switch--client-current client))
+         (current (nth 0 current-result))
+         (error-text (nth 1 current-result))
+         (loading-p (nth 2 current-result))
+         (profiles (agent-switch-profiles client-id))
+         (matching
+          (and current
+               (cl-find-if
+                (lambda (profile)
+                  (and (agent-switch-profile-valid-p profile)
+                       (condition-case nil
+                           (agent-switch-profile-current-p
+                            client profile current nil)
+                         (error nil))))
+                profiles)))
+         (last-id (agent-switch-state-last-selected client-id)))
+    (when loading-p
+      (user-error "Current state is still loading"))
+    (when error-text
+      (user-error "%s" error-text))
+    (or matching
+        (and last-id (agent-switch-find-profile client-id last-id t))
+        (user-error "No managed Profile matches current state; use Import Current"))))
+
+(defun agent-switch-profile-edit ()
+  "Visit the selected or effective managed Profile JSON."
+  (interactive)
+  (let* ((profile (or (agent-switch--profile-at-point-noerror)
+                      (agent-switch--effective-profile-for-client
+                       (agent-switch--client-at-point))))
+         (source (agent-switch-profile-source profile)))
+    (unless (eq (agent-switch-profile-ownership profile) 'managed)
+      (user-error "Read-only Profile; use Copy first"))
+    (unless (stringp source)
+      (user-error "Profile has no managed source file"))
+    (find-file source)))
+
+(defun agent-switch--open-imported-profile (client payload)
+  "Save captured PAYLOAD as a new managed Profile for CLIENT."
   (unless (hash-table-p payload)
     (signal 'agent-switch-validation-error
             '("capture-current must return a Profile payload object")))
-  (let ((profile (agent-switch--make-profile
-                  :id "captured" :client-id (agent-switch-client-id client)
-                  :name (format "Captured %s" (agent-switch-client-name client))
-                  :payload payload :ownership 'managed :valid-p t)))
-    (agent-switch--open-profile-form client profile t)))
+  (agent-switch--save-new-profile
+   client
+   (agent-switch--read-profile-name
+    (format "Imported %s" (agent-switch-client-name client)))
+   payload))
 
-(defun agent-switch-adopt-current ()
-  "Capture current Client state into a new managed Profile form."
+(defun agent-switch-import-current ()
+  "Import current Client state as a new managed Profile."
   (interactive)
   (let* ((client (agent-switch--client-at-point))
          (adapter (agent-switch-get-adapter
@@ -813,10 +946,12 @@ Refresh immediately for direct values."
          (loading-p (nth 2 current-result)))
     (agent-switch--ensure-client-idle client)
     (unless capture
-      (user-error "%s cannot capture current state"
+      (user-error "%s cannot import current state"
                   (agent-switch-adapter-name adapter)))
-    (when loading-p (user-error "Current state is still loading"))
-    (when error-text (user-error "%s" error-text))
+    (when loading-p
+      (user-error "Current state is still loading"))
+    (when error-text
+      (user-error "%s" error-text))
     (let ((result (funcall capture client current nil))
           (buffer (current-buffer)))
       (if (agent-switch-job-p result)
@@ -825,506 +960,56 @@ Refresh immediately for direct values."
            (lambda (payload)
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
-                 (agent-switch--open-captured-profile client payload))))
+                 (agent-switch--open-imported-profile client payload))))
            (lambda (error-value)
              (message "agent-switch: %s"
                       (agent-switch--safe-error-message error-value))))
-        (agent-switch--open-captured-profile client result)))))
+        (agent-switch--open-imported-profile client result)))))
 
-(defun agent-switch--profile-field-value (profile field)
-  "Return PROFILE value described by FIELD."
-  (agent-switch-json-get-in (agent-switch-profile-payload profile)
-                            (plist-get field :path)))
-
-(defun agent-switch--secret-reference-display (value)
-  "Return editable text for secret reference VALUE."
-  (if (not (agent-switch-secret-reference-p value))
-      ""
-    (pcase (gethash "source" value)
-      ("env" (concat "env:" (gethash "name" value)))
-      ("auth-source"
-       (string-join
-        (delq nil (list "auth-source" (gethash "host" value)
-                        (gethash "user" value))) ":"))
-      (_ ""))))
-
-(defun agent-switch--parse-secret-reference (text)
-  "Parse secret reference TEXT into a JSON object."
-  (cond
-   ((string-prefix-p "env:" text)
-    (let ((object (make-hash-table :test #'equal)))
-      (puthash "source" "env" object)
-      (puthash "name" (substring text 4) object)
-      (unless (agent-switch-secret-reference-p object)
-        (user-error "Expected env:VARIABLE"))
-      object))
-   ((string-prefix-p "auth-source:" text)
-    (let* ((parts (split-string text ":"))
-           (object (make-hash-table :test #'equal)))
-      (puthash "source" "auth-source" object)
-      (puthash "host" (nth 1 parts) object)
-      (when-let* ((user (nth 2 parts))) (puthash "user" user object))
-      (unless (agent-switch-secret-reference-p object)
-        (user-error "Expected auth-source:HOST[:USER]"))
-      object))
-   (t (user-error "Use env:VARIABLE or auth-source:HOST[:USER]"))))
-
-(defun agent-switch-profile-edit--mark-dirty (&rest _ignore)
-  "Mark the current Profile form dirty."
-  (setq agent-switch-profile-edit--dirty-p t))
-
-(defun agent-switch--field-choices (field client profile)
-  "Return FIELD choices for CLIENT and PROFILE."
-  (let ((choices (plist-get field :choices)))
-    (cond ((functionp choices) (funcall choices client profile))
-          ((and (symbolp choices) (fboundp choices))
-           (funcall choices client profile))
-          (t choices))))
-
-(defun agent-switch--insert-form-field (client profile field)
-  "Insert a widget for CLIENT PROFILE FIELD and remember it."
-  (let* ((type (plist-get field :type))
-         (label (or (plist-get field :label) (plist-get field :key)))
-         (value (agent-switch--profile-field-value profile field))
-         (notify #'agent-switch-profile-edit--mark-dirty)
-         widget)
-    (widget-insert (format "%-28s " (concat label ":")))
-    (setq widget
-          (pcase type
-            ('boolean
-             (widget-create 'checkbox :value (eq value t) :notify notify))
-            ('choice
-             (let ((choices (agent-switch--field-choices field client profile)))
-               (if choices
-                   (apply #'widget-create
-                          'menu-choice
-                          :value value :notify notify
-                          (mapcar (lambda (choice)
-                                    `(item :tag ,(format "%s" choice)
-                                           :value ,choice))
-                                  choices))
-                 (widget-create 'editable-field
-                                :value (or value "") :notify notify))))
-            ('integer
-             (widget-create 'editable-field
-                            :value (if (integerp value)
-                                       (number-to-string value) "")
-                            :notify notify))
-            ('string-list
-             (widget-create 'editable-field
-                            :value (string-join (append value nil) ", ")
-                            :notify notify))
-            ('secret-reference
-             (widget-create 'editable-field
-                            :value (agent-switch--secret-reference-display value)
-                            :notify notify))
-            (_
-             (widget-create 'editable-field
-                            :value (if (stringp value) value "")
-                            :notify notify))))
-    (widget-insert "\n")
-    (push (list :field field :widget widget) agent-switch-profile-edit--widgets)))
-
-(defun agent-switch--make-edit-profile (client profile new-p id name description)
-  "Return editable Profile for CLIENT based on PROFILE and form values.
-NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
-  (let ((result (copy-agent-switch-profile profile)))
-    (setf (agent-switch-profile-id result) id
-          (agent-switch-profile-client-id result) (agent-switch-client-id client)
-          (agent-switch-profile-name result) name
-          (agent-switch-profile-description result)
-          (unless (string-empty-p description) description)
-          (agent-switch-profile-ownership result) 'managed
-          (agent-switch-profile-valid-p result) t)
-    (when new-p
-      (setf (agent-switch-profile-source result) nil
-            (agent-switch-profile-source-hash result) nil))
-    result))
-
-(defun agent-switch-profile-edit--widget (key)
-  "Return core form widget stored under KEY."
-  (plist-get agent-switch-profile-edit--core-widgets key))
-
-(defun agent-switch--field-widget-value (entry)
-  "Convert form widget ENTRY to its JSON field value."
-  (let* ((field (plist-get entry :field))
-         (type (plist-get field :type))
-         (raw (widget-value (plist-get entry :widget))))
-    (pcase type
-      ('integer
-       (if (string-empty-p (string-trim raw)) nil
-         (unless (string-match-p "\\`[-+]?[0-9]+\\'" (string-trim raw))
-           (user-error "%s must be an integer" (plist-get field :label)))
-         (string-to-number raw)))
-      ('boolean (if raw t agent-switch-json-false))
-      ('string-list
-       (vconcat (split-string raw "[[:space:]]*,[[:space:]]*" t)))
-      ('secret-reference
-       (if (string-empty-p (string-trim raw)) nil
-         (agent-switch--parse-secret-reference (string-trim raw))))
-      (_ (if (and (stringp raw) (string-empty-p (string-trim raw)))
-             nil raw)))))
-
-(defun agent-switch-profile-edit--finish-save (buffer client profile)
-  "Save CLIENT PROFILE when editor BUFFER is still live."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (setq agent-switch-profile-edit--saving-p t
-            agent-switch-profile-edit--validation-job nil)
-      (agent-switch-save-profile profile)
-      (setq agent-switch-profile-edit--dirty-p nil)
-      (agent-switch-refresh-dashboards)
-      (kill-buffer buffer)
-      (message "Saved Profile %s/%s"
-               (agent-switch-client-id client)
-               (agent-switch-profile-id profile)))))
-
-(defun agent-switch-profile-edit-save ()
-  "Validate and save the current Profile form."
-  (interactive)
-  (let* ((buffer (current-buffer))
-         (client agent-switch-profile-edit--client)
-         (id (string-trim
-              (widget-value (agent-switch-profile-edit--widget :id))))
-         (name (string-trim
-                (widget-value (agent-switch-profile-edit--widget :name))))
-         (description
-          (string-trim
-           (widget-value (agent-switch-profile-edit--widget :description))))
-         (profile (agent-switch--make-edit-profile
-                   client agent-switch-profile-edit--profile
-                   agent-switch-profile-edit--new-p id name description))
-         (payload (agent-switch-json-copy
-                   (agent-switch-profile-payload profile))))
-    (agent-switch--ensure-client-idle client)
-    (unless (and (not (string-empty-p id)) (not (string-empty-p name)))
-      (user-error "Profile ID and name are required"))
-    (dolist (entry (cl-remove-if-not
-                    (lambda (item) (plist-get item :field))
-                    agent-switch-profile-edit--widgets))
-      (let* ((field (plist-get entry :field))
-             (path (plist-get field :path))
-             (widget (plist-get entry :widget))
-             value)
-        (condition-case error-value
-            (setq value (agent-switch--field-widget-value entry))
-          (user-error
-           (goto-char (widget-get widget :from))
-           (signal (car error-value) (cdr error-value))))
-        (when (and (plist-get field :required)
-                   (or (null value)
-                       (and (stringp value) (string-empty-p value))))
-          (goto-char (widget-get widget :from))
-          (user-error "%s is required" (plist-get field :label)))
-        (if (null value)
-            (agent-switch-json-remove-in payload path)
-          (agent-switch-json-put-in payload path value))))
-    (setf (agent-switch-profile-payload profile) payload)
-    (let* ((adapter (agent-switch-get-adapter
-                     (agent-switch-client-adapter-id client)))
-           (validate (agent-switch-adapter-callback adapter :validate)))
-      (let ((result (and validate (funcall validate client profile nil))))
-        (if (agent-switch-job-p result)
-            (progn
-              (setq agent-switch-profile-edit--saving-p t
-                    agent-switch-profile-edit--validation-job result)
-              (message "Validating Profile %s..." id)
-              (agent-switch-job-start
-               result
-               (lambda (_value)
-                 (agent-switch-profile-edit--finish-save
-                  buffer client profile))
-               (lambda (error-value)
-                 (when (buffer-live-p buffer)
-                   (with-current-buffer buffer
-                     (setq agent-switch-profile-edit--saving-p nil
-                           agent-switch-profile-edit--validation-job nil))
-                   (message "agent-switch validation: %s"
-                            (agent-switch--safe-error-message error-value))))))
-          (agent-switch-profile-edit--finish-save buffer client profile))))))
-
-(defun agent-switch-profile-edit-cancel ()
-  "Cancel the current Profile form."
-  (interactive)
-  (when (and agent-switch-profile-edit--dirty-p
-             (not (yes-or-no-p "Discard unsaved Profile changes? ")))
-    (user-error "Cancelled"))
-  (when (agent-switch-job-p agent-switch-profile-edit--validation-job)
-    (agent-switch-job-cancel agent-switch-profile-edit--validation-job))
-  (setq agent-switch-profile-edit--dirty-p nil
-        agent-switch-profile-edit--validation-job nil)
-  (kill-buffer (current-buffer)))
-
-(defun agent-switch-profile-edit--kill-query ()
-  "Confirm killing a dirty Profile editor."
-  (or agent-switch-profile-edit--saving-p
-      (not agent-switch-profile-edit--dirty-p)
-      (yes-or-no-p "Discard unsaved Profile changes? ")))
-
-(defun agent-switch-profile-edit--cleanup ()
-  "Cancel pending validation owned by the current Profile editor."
-  (when (agent-switch-job-p agent-switch-profile-edit--validation-job)
-    (agent-switch-job-cancel agent-switch-profile-edit--validation-job)))
-
-(defun agent-switch-profile-edit-next-field ()
-  "Move to the next form field and enter Evil insert state when available."
-  (interactive)
-  (widget-forward 1)
-  (when (fboundp 'evil-insert-state) (evil-insert-state)))
-
-(defun agent-switch-profile-edit-previous-field ()
-  "Move to the previous form field and enter Evil insert state when available."
-  (interactive)
-  (widget-backward 1)
-  (when (fboundp 'evil-insert-state) (evil-insert-state)))
-
-(defvar agent-switch-profile-edit-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
-    (define-key map (kbd "C-c C-c") #'agent-switch-profile-edit-save)
-    (define-key map (kbd "C-c C-k") #'agent-switch-profile-edit-cancel)
-    (define-key map (kbd "TAB") #'agent-switch-profile-edit-next-field)
-    (define-key map (kbd "<tab>") #'agent-switch-profile-edit-next-field)
-    (define-key map (kbd "<backtab>") #'agent-switch-profile-edit-previous-field)
-    (define-key map (kbd "<S-tab>") #'agent-switch-profile-edit-previous-field)
-    map)
-  "Keymap for `agent-switch-profile-edit-mode'.")
-
-(define-derived-mode agent-switch-profile-edit-mode special-mode
-  "Agent-Profile-Edit"
-  "Major mode for editing a managed agent-switch Profile."
-  (setq-local truncate-lines nil)
-  (setq-local buffer-read-only nil)
-  (add-hook 'kill-buffer-query-functions
-            #'agent-switch-profile-edit--kill-query nil t)
-  (add-hook 'kill-buffer-hook #'agent-switch-profile-edit--cleanup nil t))
-
-(defun agent-switch--open-profile-form (client profile new-p)
-  "Open widget form for CLIENT PROFILE, marking it NEW-P."
-  (let* ((adapter (agent-switch-get-adapter
-                   (agent-switch-client-adapter-id client)))
-         (editor (agent-switch-adapter-editor adapter))
-         (fields (agent-switch-adapter-profile-fields adapter)))
-    (cond
-     (editor (funcall editor client profile new-p))
-     ((not fields)
-      (user-error "%s does not provide a Profile editor"
-                  (agent-switch-adapter-name adapter)))
-     (t
-      (let ((buffer (get-buffer-create
-                     (format "*agent-switch edit %s*"
-                             (agent-switch-profile-id profile)))))
-        (with-current-buffer buffer
-          (agent-switch-profile-edit-mode)
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (remove-overlays)
-            (setq agent-switch-profile-edit--client client
-                  agent-switch-profile-edit--profile profile
-                  agent-switch-profile-edit--new-p new-p
-                  agent-switch-profile-edit--core-widgets nil
-                  agent-switch-profile-edit--widgets nil
-                  agent-switch-profile-edit--dirty-p nil
-                  agent-switch-profile-edit--saving-p nil
-                  agent-switch-profile-edit--validation-job nil)
-            (widget-insert (propertize
-                            (if new-p "Create Profile" "Edit Profile")
-                            'face 'agent-switch-title)
-                           "\n\n")
-            (widget-insert (format "%-28s " "Profile ID:"))
-            (let ((widget (if new-p
-                              (widget-create 'editable-field
-                                             :value (agent-switch-profile-id profile)
-                                             :notify #'agent-switch-profile-edit--mark-dirty)
-                            (widget-create 'item
-                                           :value (agent-switch-profile-id profile)))))
-              (setq agent-switch-profile-edit--core-widgets
-                    (plist-put agent-switch-profile-edit--core-widgets
-                               :id widget)))
-            (widget-insert "\n")
-            (widget-insert (format "%-28s " "Name:"))
-            (setq agent-switch-profile-edit--core-widgets
-                  (plist-put
-                   agent-switch-profile-edit--core-widgets :name
-                   (widget-create 'editable-field
-                                  :value (agent-switch-profile-name profile)
-                                  :notify #'agent-switch-profile-edit--mark-dirty)))
-            (widget-insert "\n")
-            (widget-insert (format "%-28s " "Description:"))
-            (setq agent-switch-profile-edit--core-widgets
-                  (plist-put
-                   agent-switch-profile-edit--core-widgets :description
-                   (widget-create 'editable-field
-                                  :value (or (agent-switch-profile-description profile) "")
-                                  :notify #'agent-switch-profile-edit--mark-dirty)))
-            (widget-insert "\n\n")
-            (dolist (field fields)
-              (agent-switch--insert-form-field client profile field))
-            (setq agent-switch-profile-edit--widgets
-                  (nreverse agent-switch-profile-edit--widgets))
-            (widget-insert "\n")
-            (widget-create 'push-button
-                           :notify (lambda (&rest _ignore)
-                                     (agent-switch-profile-edit-save))
-                           "Save")
-            (widget-insert "  ")
-            (widget-create 'push-button
-                           :notify (lambda (&rest _ignore)
-                                     (agent-switch-profile-edit-cancel))
-                           "Cancel")
-            (widget-setup)
-            (goto-char (point-min))))
-        (pop-to-buffer buffer))))))
-
-(defun agent-switch-profile-create ()
-  "Create a managed Profile for the Client at point."
-  (interactive)
-  (let* ((client (or (agent-switch--client-at-point t)
-                     (agent-switch-get-client
-                      (completing-read
-                       "Client: "
-                       (mapcar #'agent-switch-client-id
-                               (agent-switch-clients)) nil t))))
-         (payload (make-hash-table :test #'equal))
-         (profile (agent-switch--make-profile
-                   :id "new-profile" :client-id (agent-switch-client-id client)
-                   :name "New Profile" :payload payload
-                   :ownership 'managed :valid-p t)))
-    (agent-switch--ensure-client-idle client)
-    (agent-switch--open-profile-form client profile t)))
-
-(defun agent-switch-profile-edit ()
-  "Edit the managed Profile at point."
+(defun agent-switch-profile-copy ()
+  "Copy the Profile at point to a new managed Profile and visit it."
   (interactive)
   (let* ((profile (agent-switch--profile-at-point))
          (client (agent-switch-get-client
                   (agent-switch-profile-client-id profile))))
     (agent-switch--ensure-client-idle client)
-    (if (eq (agent-switch-profile-ownership profile) 'external)
-        (let* ((adapter (agent-switch-get-adapter
-                         (agent-switch-client-adapter-id client)))
-               (edit (agent-switch-adapter-callback adapter :edit-profile)))
-          (unless edit
-            (user-error "External Profiles are read-only; copy it as managed first"))
-          (agent-switch--run-client-operation
-           client "External Profile edit" (funcall edit client profile nil)))
-      (unless (agent-switch-profile-valid-p profile)
-        (user-error "Open the damaged JSON file and repair it first"))
-      (agent-switch--open-profile-form client profile nil))))
-
-(defun agent-switch--copy-profile (profile id name)
-  "Open a managed copy of PROFILE using ID and NAME."
-  (let* ((client (agent-switch-get-client
-                  (agent-switch-profile-client-id profile)))
-         (copy (copy-agent-switch-profile profile)))
-    (agent-switch--ensure-client-idle client)
-    (setf (agent-switch-profile-id copy) id
-          (agent-switch-profile-name copy) name
-          (agent-switch-profile-ownership copy) 'managed
-          (agent-switch-profile-source copy) nil
-          (agent-switch-profile-source-hash copy) nil
-          (agent-switch-profile-valid-p copy) t
-          (agent-switch-profile-error copy) nil)
-    (agent-switch--open-profile-form client copy t)))
-
-(defun agent-switch-profile-duplicate ()
-  "Duplicate the Profile at point as a managed Profile."
-  (interactive)
-  (let* ((profile (agent-switch--profile-at-point))
-         (id (read-string "New Profile ID: "
-                          (concat (agent-switch-profile-id profile) "-copy"))))
-    (agent-switch--copy-profile
-     profile id (concat (agent-switch-profile-name profile) " Copy"))))
-
-(defun agent-switch-profile-copy-as-managed ()
-  "Copy the external Profile at point as managed."
-  (interactive)
-  (let ((profile (agent-switch--profile-at-point)))
-    (agent-switch--ensure-client-idle
-     (agent-switch-get-client (agent-switch-profile-client-id profile)))
-    (unless (eq (agent-switch-profile-ownership profile) 'external)
-      (user-error "Profile is already managed"))
-    (agent-switch--copy-profile
-     profile
-     (read-string "Managed Profile ID: " (agent-switch-profile-id profile))
-     (agent-switch-profile-name profile))))
-
-(defun agent-switch-profile-rename ()
-  "Rename the managed Profile display name at point."
-  (interactive)
-  (let ((profile (agent-switch--profile-at-point)))
-    (agent-switch--ensure-client-idle
-     (agent-switch-get-client (agent-switch-profile-client-id profile)))
-    (unless (eq (agent-switch-profile-ownership profile) 'managed)
-      (user-error "External Profiles cannot be renamed"))
-    (setf (agent-switch-profile-name profile)
-          (read-string "Display name: " (agent-switch-profile-name profile)))
-    (agent-switch-save-profile profile)
-    (agent-switch-refresh-dashboards)))
-
-(defun agent-switch-profile-change-id ()
-  "Change the managed Profile ID using an explicit copy/delete operation."
-  (interactive)
-  (let* ((profile (agent-switch--profile-at-point))
-         (new-id (agent-switch--string-id
-                  (read-string "New Profile ID: "
-                               (agent-switch-profile-id profile))
-                  "profile")))
-    (agent-switch--ensure-client-idle
-     (agent-switch-get-client (agent-switch-profile-client-id profile)))
-    (unless (eq (agent-switch-profile-ownership profile) 'managed)
-      (user-error "External Profiles cannot change ID"))
-    (unless (yes-or-no-p
-             (format "Change Profile ID %s to %s? "
-                     (agent-switch-profile-id profile) new-id))
-      (user-error "Cancelled"))
-    (let ((copy (copy-agent-switch-profile profile)))
-      (setf (agent-switch-profile-id copy) new-id
-            (agent-switch-profile-source copy) nil
-            (agent-switch-profile-source-hash copy) nil)
-      (agent-switch-save-profile copy)
-      (condition-case error-value
-          (agent-switch-delete-profile profile)
-        (error
-         (signal 'agent-switch-error
-                 (list (format "New Profile saved, but old ID could not be removed: %s"
-                               (agent-switch--safe-error-message error-value)))))))
-    (agent-switch-refresh-dashboards)))
+    (unless (agent-switch-profile-valid-p profile)
+      (user-error "Invalid Profile cannot be copied safely"))
+    (agent-switch--save-new-profile
+     client
+     (concat (agent-switch-profile-name profile) " Copy")
+     (agent-switch-json-copy (agent-switch-profile-payload profile)))))
 
 (defun agent-switch-profile-delete ()
-  "Delete the managed Profile at point without changing the live Client."
+  "Delete the inactive managed Profile at point."
   (interactive)
   (let* ((profile (agent-switch--profile-at-point))
          (client-id (agent-switch-profile-client-id profile))
          (client (agent-switch-get-client client-id))
-         (adapter (agent-switch-get-adapter
-                   (agent-switch-client-adapter-id client)))
          (current-result (agent-switch--client-current client))
          (current (nth 0 current-result))
-         (current-p (and current
-                         (condition-case nil
-                             (agent-switch-profile-current-p
-                              client profile current nil)
-                           (error nil)))))
+         (current-p
+          (and current
+               (condition-case nil
+                   (agent-switch-profile-current-p client profile current nil)
+                 (error nil))))
+         (last-selected (agent-switch-state-last-selected client-id))
+         (source (agent-switch-profile-source profile))
+         (visiting (and (stringp source) (find-buffer-visiting source))))
     (agent-switch--ensure-client-idle client)
-    (when current-p
-      (unless (yes-or-no-p
-               "Active Profile; keep live Client unchanged and continue? ")
-        (user-error "Cancelled")))
+    (unless (eq (agent-switch-profile-ownership profile) 'managed)
+      (user-error "Read-only Profiles cannot be deleted"))
+    (when (or current-p
+              (equal (agent-switch-profile-id profile) last-selected))
+      (user-error "Current Profile cannot be deleted; Apply another Profile first"))
+    (when (and visiting (buffer-modified-p visiting))
+      (user-error "Profile has unsaved changes in %s" (buffer-name visiting)))
     (unless (yes-or-no-p
              (format "Delete managed Profile %s? "
                      (agent-switch-profile-name profile)))
       (user-error "Cancelled"))
-    (if (eq (agent-switch-profile-ownership profile) 'managed)
-        (progn
-          (agent-switch-delete-profile profile)
-          (agent-switch-refresh-dashboards))
-      (let ((delete (agent-switch-adapter-callback adapter :delete-profile)))
-        (unless delete
-          (user-error "External Profiles cannot be deleted"))
-        (agent-switch--run-client-operation
-         client "External Profile delete"
-         (funcall delete client profile nil))))))
+    (agent-switch-delete-profile profile)
+    (agent-switch-refresh-dashboards)))
 
 (defun agent-switch--move-profile (direction)
   "Move Profile at point by DIRECTION in state order."
@@ -1360,19 +1045,6 @@ NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
       (user-error "Profile has no managed source file"))
     (find-file (agent-switch-profile-source profile))))
 
-(defun agent-switch-open-client-config ()
-  "Open the Client configuration path at point."
-  (interactive)
-  (let* ((client (agent-switch--client-at-point))
-         (adapter (agent-switch-get-adapter
-                   (agent-switch-client-adapter-id client)))
-         (paths (agent-switch-adapter-callback adapter :watch-paths)))
-    (unless paths (user-error "Adapter does not expose a config path"))
-    (let ((result (funcall paths client nil)))
-      (when (agent-switch-job-p result)
-        (user-error "Config path is still loading"))
-      (find-file (car result)))))
-
 (defun agent-switch-diagnose ()
   "Display sanitized agent-switch diagnostics."
   (interactive)
@@ -1398,25 +1070,18 @@ NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
 
 (transient-define-prefix agent-switch-menu ()
   "Open the agent-switch action menu."
-  [["View"
+  [["Profile"
+    ("a" "Apply" agent-switch-activate-at-point)
+    ("n" "New" agent-switch-profile-new)
+    ("c" "Copy" agent-switch-profile-copy)
+    ("e" "Edit" agent-switch-profile-edit)
+    ("i" "Import Current" agent-switch-import-current)
+    ("D" "Delete" agent-switch-profile-delete)]
+   ["View"
     ("g" "Refresh" agent-switch-refresh)
     ("RET" "Details" agent-switch-profile-details)
     ("d" "Diagnose" agent-switch-diagnose)
-    ("o" "Open client config" agent-switch-open-client-config)
-    ("f" "Open Profile JSON" agent-switch-open-profile-file)]
-   ["Activate"
-    ("s" "Activate Profile" agent-switch-activate-at-point)
-    ("l" "Reapply last selected" agent-switch-reapply-last-selected)
-    ("A" "Adopt current" agent-switch-adopt-current)
     ("r" "Reset damaged state" agent-switch-reset-state)]
-   ["Manage"
-    ("a" "Create" agent-switch-profile-create)
-    ("e" "Edit" agent-switch-profile-edit)
-    ("c" "Copy external" agent-switch-profile-copy-as-managed)
-    ("u" "Duplicate" agent-switch-profile-duplicate)
-    ("R" "Rename" agent-switch-profile-rename)
-    ("I" "Change ID" agent-switch-profile-change-id)
-    ("D" "Delete" agent-switch-profile-delete)]
    ["Order"
     ("<up>" "Move up" agent-switch-profile-move-up :transient t)
     ("<down>" "Move down" agent-switch-profile-move-down :transient t)]])
@@ -1429,7 +1094,6 @@ NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
     (define-key map (kbd "<backtab>") #'agent-switch-cycle-sections)
     (define-key map (kbd "<S-tab>") #'agent-switch-cycle-sections)
     (define-key map (kbd "RET") #'agent-switch-return)
-    (define-key map (kbd "s") #'agent-switch-activate-at-point)
     (define-key map (kbd "?") #'agent-switch-menu)
     (define-key map (kbd "q") #'quit-window)
     ;; Evil's state maps intentionally retain these keys in normal state.
@@ -1473,6 +1137,13 @@ NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
 (defun agent-switch--install-watchers ()
   "Install file and runtime watchers for the current dashboard."
   (let ((buffer (current-buffer)))
+    (when-let* ((watch-path
+                 (agent-switch--watchable-path
+                  (agent-switch-profiles-directory))))
+      (push (file-notify-add-watch
+             watch-path '(change attribute-change)
+             (lambda (event) (agent-switch--watch-callback buffer event)))
+            agent-switch--watch-descriptors))
     (dolist (client (agent-switch-clients))
       (let* ((adapter (agent-switch-get-adapter
                        (agent-switch-client-adapter-id client)))
@@ -1541,26 +1212,17 @@ NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
 
 (with-eval-after-load 'evil
   (evil-set-initial-state 'agent-switch-mode 'normal)
-  (evil-set-initial-state 'agent-switch-profile-edit-mode 'normal)
   ;; Only shared structural/action keys are installed in Evil normal state.
-  ;; g, n/p, and M-n/M-p intentionally remain native Evil bindings.
+  ;; g, n/p, M-n/M-p, and mutation keys remain native or transient-only.
   (dolist (binding '(("TAB" . agent-switch-toggle-section)
                      ("<tab>" . agent-switch-toggle-section)
                      ("<backtab>" . agent-switch-cycle-sections)
                      ("<S-tab>" . agent-switch-cycle-sections)
                      ("RET" . agent-switch-return)
-                     ("s" . agent-switch-activate-at-point)
                      ("?" . agent-switch-menu)
                      ("q" . quit-window)))
     (evil-define-key* 'normal agent-switch-mode-map
-      (kbd (car binding)) (cdr binding)))
-  (evil-define-key* 'normal agent-switch-profile-edit-mode-map
-    (kbd "C-c C-c") #'agent-switch-profile-edit-save
-    (kbd "C-c C-k") #'agent-switch-profile-edit-cancel
-    (kbd "TAB") #'agent-switch-profile-edit-next-field
-    (kbd "<tab>") #'agent-switch-profile-edit-next-field
-    (kbd "<backtab>") #'agent-switch-profile-edit-previous-field
-    (kbd "<S-tab>") #'agent-switch-profile-edit-previous-field))
+      (kbd (car binding)) (cdr binding))))
 
 ;;;###autoload
 (defun agent-switch-dashboard ()
@@ -1572,7 +1234,6 @@ NEW-P clears source identity; ID, NAME, and DESCRIPTION come from the form."
         (agent-switch-mode))
       (agent-switch-refresh))
     (pop-to-buffer buffer)))
-
 (provide 'agent-switch-ui)
 
 ;;; agent-switch-ui.el ends here

@@ -579,11 +579,19 @@ When NOERROR is non-nil, return nil on absence."
    (agent-switch-profile-client-id profile)
    (agent-switch-profile-id profile)))
 
+(defun agent-switch-profile-payload-fingerprint (profile-or-payload)
+  "Return a stable fingerprint for PROFILE-OR-PAYLOAD."
+  (let ((payload (if (agent-switch-profile-p profile-or-payload)
+                     (agent-switch-profile-payload profile-or-payload)
+                   profile-or-payload)))
+    (agent-switch-content-hash (agent-switch-json-serialize payload))))
+
 (defun agent-switch--empty-state ()
   "Return a new versioned state object."
   (let ((object (make-hash-table :test #'equal)))
     (puthash "schema_version" agent-switch-storage-schema-version object)
     (puthash "last_selected" (make-hash-table :test #'equal) object)
+    (puthash "applied_profiles" (make-hash-table :test #'equal) object)
     (puthash "profile_order" (make-hash-table :test #'equal) object)
     (puthash "unprotected_confirmed" [] object)
     (puthash "canonical_confirmations" (make-hash-table :test #'equal) object)
@@ -651,15 +659,33 @@ When NOERROR is non-nil, return nil on absence."
     (and (hash-table-p last-selected)
          (gethash client-id last-selected))))
 
-(defun agent-switch-state-set-last-selected (client-id profile-id)
-  "Record PROFILE-ID as last selected for CLIENT-ID."
+(defun agent-switch-state-set-last-selected (client-id profile-id &optional profile-object)
+  "Record PROFILE-ID and its applied payload snapshot for CLIENT-ID."
   (agent-switch-update-state
    (lambda (data)
-     (let ((table (or (gethash "last_selected" data)
-                      (let ((new (make-hash-table :test #'equal)))
-                        (puthash "last_selected" new data)
-                        new))))
-       (puthash client-id profile-id table)))))
+     (let* ((profile (or profile-object
+                         (agent-switch-find-profile client-id profile-id)))
+            (snapshot (make-hash-table :test #'equal))
+            (selected (or (gethash "last_selected" data)
+                          (let ((new (make-hash-table :test #'equal)))
+                            (puthash "last_selected" new data)
+                            new)))
+            (applied (or (gethash "applied_profiles" data)
+                         (let ((new (make-hash-table :test #'equal)))
+                           (puthash "applied_profiles" new data)
+                           new))))
+       (puthash "fingerprint"
+                (agent-switch-profile-payload-fingerprint profile) snapshot)
+       (puthash "payload" (agent-switch-json-copy
+                           (agent-switch-profile-payload profile)) snapshot)
+       (puthash client-id profile-id selected)
+       (puthash client-id snapshot applied)))))
+
+(defun agent-switch-state-applied-profile (client-id)
+  "Return the applied Profile snapshot for CLIENT-ID, or nil."
+  (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
+         (applied (gethash "applied_profiles" data)))
+    (and (hash-table-p applied) (gethash client-id applied))))
 
 (defun agent-switch-state-profile-order (client-id)
   "Return saved profile order for CLIENT-ID."
@@ -685,7 +711,8 @@ When NOERROR is non-nil, return nil on absence."
   (agent-switch-update-state
    (lambda (data)
      (let ((orders (gethash "profile_order" data))
-           (last-selected (gethash "last_selected" data)))
+           (last-selected (gethash "last_selected" data))
+           (applied (gethash "applied_profiles" data)))
        (when (hash-table-p orders)
          (let ((order (gethash client-id orders)))
            (puthash client-id
@@ -693,7 +720,9 @@ When NOERROR is non-nil, return nil on absence."
                     orders)))
        (when (and (hash-table-p last-selected)
                   (equal (gethash client-id last-selected) profile-id))
-         (remhash client-id last-selected))))))
+         (remhash client-id last-selected)
+         (when (hash-table-p applied)
+           (remhash client-id applied)))))))
 
 (defun agent-switch-state-unprotected-confirmed-p (adapter-id)
   "Return non-nil if ADAPTER-ID activation risk was confirmed."

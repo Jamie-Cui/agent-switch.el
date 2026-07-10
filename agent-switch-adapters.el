@@ -217,9 +217,9 @@ secret markers exactly."
 ;;; Claude Code
 
 (defun agent-switch--claude-owned-state (settings)
-  "Extract secret-safe owned state from Claude SETTINGS."
-  (let ((owned (make-hash-table :test #'equal))
-        (owned-env (make-hash-table :test #'equal))
+  "Extract secret-safe owned state from Claude SETTINGS.
+Return nil when no ANTHROPIC_* keys are configured."
+  (let ((owned-env (make-hash-table :test #'equal))
         (env (gethash "env" settings)))
     (when (hash-table-p env)
       (dolist (key agent-switch--claude-owned-env-keys)
@@ -233,8 +233,11 @@ secret markers exactly."
                              value)
                          value)
                        owned-env))))))
-    (puthash "env" owned-env owned)
-    owned))
+    (if (> (hash-table-count owned-env) 0)
+        (let ((owned (make-hash-table :test #'equal)))
+          (puthash "env" owned-env owned)
+          owned)
+      nil)))
 
 (defun agent-switch--claude-current (_client _context)
   "Return current Claude provider-owned state."
@@ -404,23 +407,24 @@ secret markers exactly."
       nil)))
 
 (defun agent-switch--codex-current (_client _context)
-  "Return current Codex provider-owned state."
+  "Return current Codex provider-owned state.
+Return nil when no provider is configured."
   (let* ((config (agent-switch--read-toml-file
                   (agent-switch--codex-config-path)))
-         (provider-id (agent-switch--alist-get "model_provider" config))
-         (payload (make-hash-table :test #'equal)))
-    (when provider-id (puthash "provider-id" provider-id payload))
-    (when-let* ((model (agent-switch--alist-get "model" config)))
-      (puthash "model" model payload))
-    (when-let* ((small (agent-switch--alist-get "small_model" config)))
-      (puthash "small-model" small payload))
+         (provider-id (agent-switch--alist-get "model_provider" config)))
     (when provider-id
-      (puthash "provider"
-               (agent-switch--redact-json-secrets
-                (agent-switch--toml-to-json
-                 (agent-switch--codex-provider-state config provider-id)))
-               payload))
-    payload))
+      (let ((payload (make-hash-table :test #'equal)))
+        (puthash "provider-id" provider-id payload)
+        (when-let* ((model (agent-switch--alist-get "model" config)))
+          (puthash "model" model payload))
+        (when-let* ((small (agent-switch--alist-get "small_model" config)))
+          (puthash "small-model" small payload))
+        (puthash "provider"
+                 (agent-switch--redact-json-secrets
+                  (agent-switch--toml-to-json
+                   (agent-switch--codex-provider-state config provider-id)))
+                 payload)
+        payload))))
 
 (defun agent-switch--codex-validate (_client profile _context)
   "Validate Codex PROFILE."
@@ -538,16 +542,17 @@ CONTEXT determines whether an interactive confirmation is available."
   (and backend (gptel-backend-name backend)))
 
 (defun agent-switch--gptel-current (_client _context)
-  "Return gptel global default backend and model."
+  "Return gptel global default backend and model.
+Return nil when no backend is configured."
   (agent-switch--ensure-gptel)
-  (let ((payload (make-hash-table :test #'equal))
-        (backend (default-toplevel-value 'gptel-backend))
+  (let ((backend (default-toplevel-value 'gptel-backend))
         (model (default-toplevel-value 'gptel-model)))
     (when backend
-      (puthash "backend-name" (agent-switch--gptel-backend-name backend) payload))
-    (when model
-      (puthash "model" (if (symbolp model) (symbol-name model) model) payload))
-    payload))
+      (let ((payload (make-hash-table :test #'equal)))
+        (puthash "backend-name" (agent-switch--gptel-backend-name backend) payload)
+        (when model
+          (puthash "model" (if (symbolp model) (symbol-name model) model) payload))
+        payload))))
 
 (defun agent-switch--gptel-models-for-backend (backend-name)
   "Return model name strings for gptel BACKEND-NAME."
@@ -725,24 +730,26 @@ String contents and line positions are preserved."
        (match-string 1 model)))
 
 (defun agent-switch--opencode-current (_client _context)
-  "Return current OpenCode global provider-owned state."
+  "Return current OpenCode global provider-owned state.
+Return nil when no model is configured."
   (let* ((config (agent-switch--read-opencode-file
                   (agent-switch--opencode-config-path)))
          (model (gethash "model" config))
-         (provider-id (agent-switch--model-provider-id model))
-         (payload (make-hash-table :test #'equal))
-         (providers (gethash "provider" config)))
-    (when provider-id (puthash "provider-id" provider-id payload))
-    (when model (puthash "model" model payload))
-    (when-let* ((small (gethash "small_model" config)))
-      (puthash "small-model" small payload))
-    (when (and provider-id (hash-table-p providers))
-      (puthash "provider"
-               (agent-switch--redact-json-secrets
-                (or (gethash provider-id providers)
-                    (make-hash-table :test #'equal)))
-               payload))
-    payload))
+         (provider-id (agent-switch--model-provider-id model)))
+    (when model
+      (let ((payload (make-hash-table :test #'equal))
+            (providers (gethash "provider" config)))
+        (when provider-id (puthash "provider-id" provider-id payload))
+        (puthash "model" model payload)
+        (when-let* ((small (gethash "small_model" config)))
+          (puthash "small-model" small payload))
+        (when (and provider-id (hash-table-p providers))
+          (puthash "provider"
+                   (agent-switch--redact-json-secrets
+                    (or (gethash provider-id providers)
+                        (make-hash-table :test #'equal)))
+                   payload))
+        payload))))
 
 (defun agent-switch--opencode-validate (_client profile _context)
   "Validate OpenCode PROFILE."
@@ -808,12 +815,42 @@ String contents and line positions are preserved."
 
 ;;; Registration
 
-(defconst agent-switch--common-provider-fields
-  '((:key "provider-id" :path ("provider-id") :label "Provider ID" :type string
-     :required t)
-    (:key "model" :path ("model") :label "Model" :type string :required t)
-    (:key "small-model" :path ("small-model") :label "Small model" :type string))
-  "Shared declarative fields for Codex and OpenCode profiles.")
+(defun agent-switch--template-object (&rest entries)
+  "Return a JSON object populated from ENTRIES cons cells."
+  (let ((object (make-hash-table :test #'equal)))
+    (dolist (entry entries object)
+      (puthash (car entry) (cdr entry) object))))
+
+(defun agent-switch--claude-profile-template (_client _context)
+  "Return a new Claude Profile payload template."
+  (agent-switch--template-object
+   (cons "env" (agent-switch--template-object
+                '("ANTHROPIC_BASE_URL" . "")
+                '("ANTHROPIC_MODEL" . "")
+                '("ANTHROPIC_DEFAULT_HAIKU_MODEL" . "")
+                '("ANTHROPIC_DEFAULT_SONNET_MODEL" . "")
+                '("ANTHROPIC_DEFAULT_OPUS_MODEL" . "")))))
+
+(defun agent-switch--codex-profile-template (_client _context)
+  "Return a new Codex Profile payload template."
+  (agent-switch--template-object
+   '("provider-id" . "") '("model" . "") '("small-model" . "")
+   (cons "provider" (agent-switch--template-object
+                     '("base_url" . "") '("env_key" . "")
+                     '("wire_api" . "responses")))))
+
+(defun agent-switch--gptel-profile-template (_client _context)
+  "Return a new gptel Profile payload template."
+  (agent-switch--template-object '("backend-name" . "") '("model" . "")))
+
+(defun agent-switch--opencode-profile-template (_client _context)
+  "Return a new OpenCode Profile payload template."
+  (agent-switch--template-object
+   '("provider-id" . "") '("model" . "") '("small-model" . "")
+   (cons "provider" (agent-switch--template-object
+                     '("npm" . "")
+                     (cons "options" (agent-switch--template-object
+                                      '("baseURL" . "")))))))
 
 (defun agent-switch-register-builtins ()
   "Register built-in adapters and clients."
@@ -828,19 +865,7 @@ String contents and line positions are preserved."
     :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--claude-watch-paths
     :describe #'agent-switch--claude-describe
-    :profile-fields
-    '((:key "base-url" :path ("env" "ANTHROPIC_BASE_URL")
-       :label "Base URL" :type string :required t)
-      (:key "auth-token" :path ("env" "ANTHROPIC_AUTH_TOKEN")
-       :label "Auth token" :type secret-reference :required t)
-      (:key "model" :path ("env" "ANTHROPIC_MODEL")
-       :label "Model" :type string)
-      (:key "haiku-model" :path ("env" "ANTHROPIC_DEFAULT_HAIKU_MODEL")
-       :label "Haiku model" :type string)
-      (:key "sonnet-model" :path ("env" "ANTHROPIC_DEFAULT_SONNET_MODEL")
-       :label "Sonnet model" :type string)
-      (:key "opus-model" :path ("env" "ANTHROPIC_DEFAULT_OPUS_MODEL")
-       :label "Opus model" :type string)))
+    :profile-template #'agent-switch--claude-profile-template)
   (agent-switch-register-client 'claude :name "Claude Code" :adapter 'claude)
 
   (agent-switch-define-adapter codex
@@ -854,15 +879,7 @@ String contents and line positions are preserved."
     :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--codex-watch-paths
     :describe #'agent-switch--codex-describe
-    :profile-fields
-    (append agent-switch--common-provider-fields
-            '((:key "base-url" :path ("provider" "base_url")
-               :label "Base URL" :type string)
-              (:key "env-key" :path ("provider" "env_key")
-               :label "API key environment variable" :type string)
-              (:key "wire-api" :path ("provider" "wire_api")
-               :label "Wire API" :type choice
-               :choices ("responses" "chat")))))
+    :profile-template #'agent-switch--codex-profile-template)
   (agent-switch-register-client 'codex :name "Codex" :adapter 'codex)
 
   (agent-switch-define-adapter gptel-default
@@ -876,11 +893,7 @@ String contents and line positions are preserved."
     :capture-current #'agent-switch--capture-current
     :watch-setup #'agent-switch--gptel-watch-setup
     :describe #'agent-switch--gptel-describe
-    :profile-fields
-    '((:key "backend-name" :path ("backend-name") :label "Backend"
-       :type choice :choices agent-switch--gptel-backend-choices :required t)
-      (:key "model" :path ("model") :label "Model"
-       :type choice :choices agent-switch--gptel-model-choices :required t)))
+    :profile-template #'agent-switch--gptel-profile-template)
   (agent-switch-register-client 'gptel-default
                                 :name "gptel Default"
                                 :adapter 'gptel-default)
@@ -896,12 +909,7 @@ String contents and line positions are preserved."
     :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--opencode-watch-paths
     :describe #'agent-switch--opencode-describe
-    :profile-fields
-    (append agent-switch--common-provider-fields
-            '((:key "base-url" :path ("provider" "options" "baseURL")
-               :label "Base URL" :type string)
-              (:key "npm" :path ("provider" "npm")
-               :label "Provider package" :type string))))
+    :profile-template #'agent-switch--opencode-profile-template)
   (agent-switch-register-client 'opencode-global
                                 :name "OpenCode Global"
                                 :adapter 'opencode-global))

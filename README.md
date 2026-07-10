@@ -53,7 +53,6 @@ Common keys in Evil and non-Evil sessions:
 | `TAB` | Expand or collapse the section at point |
 | `S-TAB` | Cycle all sections through collapsed, default, and expanded |
 | `RET` | Open Profile details, or toggle a Client section |
-| `s` | Activate the Profile at point |
 | `?` | Open the transient action menu |
 | `q` | Quit the dashboard window |
 
@@ -69,10 +68,10 @@ In Evil normal state, `g`, `n/p`, and `M-n/M-p` keep their native Evil
 behavior. The package deliberately does not add `gr`, `C-j/C-k`, or `gj/gk`
 alternatives.
 
-The `?` menu contains Profile create, edit, duplicate, copy-as-managed,
-rename, change-ID, delete, and reorder actions, plus diagnostics and config
-file commands. Create/Edit uses a dedicated widget form; save with `C-c C-c`
-and cancel with `C-c C-k`.
+The `?` menu contains Apply, New, Copy, Edit, Import Current, Delete, and
+reorder actions. Edit visits the managed Profile JSON using the user's normal
+Emacs file mode. Editing and saving never applies a Profile automatically;
+Apply is always explicit.
 
 ## Built-in Clients
 

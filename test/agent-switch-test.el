@@ -473,33 +473,25 @@
         (should (= (agent-switch-section-end (car (last clients)))
                    (point-max)))))))
 
-(ert-deftest agent-switch-client-headings-are-compact-and-aligned ()
+(ert-deftest agent-switch-client-headings-use-inline-status ()
   (agent-switch-test--with-root root
     (with-temp-buffer
       (agent-switch-mode)
       (agent-switch-refresh)
       (dolist (section (agent-switch--visible-sections 'client))
         (let* ((client (agent-switch-section-value section))
-               (indicator (if (char-displayable-p ?\u25be) "▾" "-"))
-               (prefix (concat
-                        indicator " "
-                        (agent-switch--display-width
-                         (agent-switch-client-name client)
-                         agent-switch-client-name-width)
-                        "  "))
+               (prefix (concat (agent-switch-client-name client) " ("))
                (start (agent-switch-section-start section)))
           (goto-char start)
           (should (string-prefix-p
                    prefix
                    (buffer-substring-no-properties
-                    (line-beginning-position) (line-end-position))))
-          (let ((name-face (get-text-property
-                            (+ start (length indicator) 1) 'face)))
-            (should (or (eq name-face 'agent-switch-section-heading)
-                        (memq 'agent-switch-section-heading name-face))))
-          (should-not
-           (eq (get-text-property (+ start (length prefix)) 'face)
-               'agent-switch-section-heading)))))))
+                    start (line-end-position))))
+          (should (eq (get-text-property start 'face) 'agent-switch-key))
+          (should (string-suffix-p
+                   ")"
+                   (buffer-substring-no-properties
+                    start (line-end-position)))))))))
 
 (ert-deftest agent-switch-dashboard-highlights-innermost-section-at-point ()
   (agent-switch-test--with-root root
@@ -569,8 +561,7 @@
               #'agent-switch-next-sibling-section))
   (should (eq (lookup-key agent-switch-mode-map (kbd "M-p"))
               #'agent-switch-previous-sibling-section))
-  (should (eq (lookup-key agent-switch-mode-map (kbd "s"))
-              #'agent-switch-activate-at-point)))
+  (should-not (lookup-key agent-switch-mode-map (kbd "s"))))
 
 (ert-deftest agent-switch-mode-recovers-old-nil-operation-registry ()
   (let ((original (default-value 'agent-switch--running-jobs)))
@@ -603,43 +594,74 @@
         (should-not (string-match-p "ANTHROPIC_AUTH_TOKEN" (buffer-string)))
         (should-not (string-match-p "TOKEN" (buffer-string)))))))
 
-(ert-deftest agent-switch-profile-widget-form-saves-managed-profile ()
+(ert-deftest agent-switch-profile-file-workflow-saves-and-opens-json ()
   (agent-switch-test--with-root root
     (let* ((client (agent-switch-get-client "claude"))
+           (payload (agent-switch-test--hash
+                     "env" (agent-switch-test--hash
+                            "ANTHROPIC_BASE_URL" "https://file.test")))
+           opened profile)
+      (cl-letf (((symbol-function 'agent-switch--random-profile-id)
+                 (lambda (_client-id) "p-1234abcd"))
+                ((symbol-function 'find-file)
+                 (lambda (path) (setq opened path))))
+        (setq profile
+              (agent-switch--save-new-profile client "File Profile" payload)))
+      (should (equal (agent-switch-profile-id profile) "p-1234abcd"))
+      (should (equal opened (agent-switch-profile-source profile)))
+      (should (file-exists-p opened))
+      (should (equal (agent-switch-profile-name
+                      (agent-switch-find-profile "claude" "p-1234abcd"))
+                     "File Profile")))))
+
+(ert-deftest agent-switch-profile-edit-uses-standard-file-visit ()
+  (agent-switch-test--with-root root
+    (let* ((profile (agent-switch-save-profile
+                     (agent-switch-test--profile
+                      "claude" "editable"
+                      (agent-switch-test--hash
+                       "env" (agent-switch-test--hash
+                              "ANTHROPIC_BASE_URL" "https://edit.test")))))
+           opened)
+      (cl-letf (((symbol-function 'agent-switch--profile-at-point-noerror)
+                 (lambda () profile))
+                ((symbol-function 'find-file)
+                 (lambda (path) (setq opened path))))
+        (agent-switch-profile-edit))
+      (should (equal opened (agent-switch-profile-source profile))))))
+
+(ert-deftest agent-switch-builtins-provide-profile-templates ()
+  (agent-switch-test--with-root root
+    (dolist (client-id '("claude" "codex" "gptel-default" "opencode-global"))
+      (let* ((client (agent-switch-get-client client-id))
+             (payload (agent-switch--new-profile-payload client)))
+        (should (hash-table-p payload))))
+    (let* ((claude (agent-switch--new-profile-payload
+                    (agent-switch-get-client "claude")))
+           (env (gethash "env" claude)))
+      (should-not (gethash "ANTHROPIC_AUTH_TOKEN" env)))
+    (let ((codex (agent-switch--new-profile-payload
+                  (agent-switch-get-client "codex"))))
+      (should (equal (gethash "wire_api" (gethash "provider" codex))
+                     "responses")))))
+
+(ert-deftest agent-switch-apply-records-payload-snapshot ()
+  (agent-switch-test--with-root root
+    (let* ((payload (agent-switch-test--hash
+                     "env" (agent-switch-test--hash
+                            "ANTHROPIC_BASE_URL" "https://snapshot.test")))
            (profile (agent-switch-test--profile
-                     "claude" "new-profile"
-                     (agent-switch-test--hash)
-                     "New Profile"))
-           buffer)
-      (save-window-excursion
-        (agent-switch--open-profile-form client profile t)
-        (setq buffer (current-buffer))
-        (with-current-buffer buffer
-          (widget-value-set
-           (agent-switch-profile-edit--widget :id) "widget-profile")
-          (widget-value-set
-           (agent-switch-profile-edit--widget :name) "Widget Profile")
-          (dolist (entry agent-switch-profile-edit--widgets)
-            (pcase (plist-get (plist-get entry :field) :key)
-              ("base-url"
-               (widget-value-set (plist-get entry :widget)
-                                 "https://widget.test"))
-              ("auth-token"
-               (widget-value-set (plist-get entry :widget)
-                                 "env:WIDGET_TOKEN"))))
-          (agent-switch-profile-edit-save)))
-      (should-not (buffer-live-p buffer))
-      (let ((loaded (agent-switch-find-profile
-                     "claude" "widget-profile")))
+                     "claude" "snapshot" payload)))
+      (agent-switch-state-set-last-selected "claude" "snapshot" profile)
+      (let ((applied (agent-switch-state-applied-profile "claude")))
+        (should (hash-table-p applied))
+        (should (equal (gethash "fingerprint" applied)
+                       (agent-switch-profile-payload-fingerprint profile)))
         (should (equal
                  (agent-switch-json-get-in
-                  (agent-switch-profile-payload loaded)
+                  (gethash "payload" applied)
                   '("env" "ANTHROPIC_BASE_URL"))
-                 "https://widget.test"))
-        (should (agent-switch-secret-reference-p
-                 (agent-switch-json-get-in
-                  (agent-switch-profile-payload loaded)
-                 '("env" "ANTHROPIC_AUTH_TOKEN"))))))))
+                 "https://snapshot.test"))))))
 
 (ert-deftest agent-switch-capture-current-removes-secret-markers ()
   (let* ((current
