@@ -18,5 +18,5 @@ coverage/
 
 # Undo-tree save-files
 *.~undo-tree
-/cc-switch-autoloads.el
-/cc-switch-pkg.el
+/agent-switch-autoloads.el
+/agent-switch-pkg.el

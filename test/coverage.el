@@ -1,4 +1,4 @@
-;;; coverage.el --- Batch coverage runner for cc-switch.el -*- lexical-binding: t; -*-
+;;; coverage.el --- Batch coverage runner for agent-switch.el -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -9,46 +9,47 @@
 (require 'ert)
 (require 'testcover)
 
-(defconst cc-switch-coverage--root-directory
+(defconst agent-switch-coverage--root-directory
   (expand-file-name ".."
                     (file-name-directory (or load-file-name buffer-file-name)))
   "Repository root for the batch coverage run.")
 
-(defvar cc-switch-coverage-min 0
+(defvar agent-switch-coverage-min 0
   "Minimum total coverage percentage required by the batch coverage run.")
 
-(defvar cc-switch-coverage-directory "coverage"
+(defvar agent-switch-coverage-directory "coverage"
   "Directory where batch coverage reports are written.")
 
-(defconst cc-switch-coverage--source-files
-  '("cc-switch.el")
+(defconst agent-switch-coverage--source-files
+  '("agent-switch-core.el" "agent-switch-storage.el"
+    "agent-switch-adapters.el" "agent-switch-ui.el" "agent-switch.el")
   "Source files instrumented by the batch coverage run.")
 
-(defconst cc-switch-coverage--test-files
-  '("test/cc-switch-test.el")
+(defconst agent-switch-coverage--test-files
+  '("test/agent-switch-test.el")
   "ERT files loaded by the batch coverage run.")
 
-(defvar cc-switch-coverage--instrumented nil
+(defvar agent-switch-coverage--instrumented nil
   "Alist mapping source file names to instrumented definition symbols.")
 
-(defun cc-switch-coverage--instrument-file (file)
+(defun agent-switch-coverage--instrument-file (file)
   "Instrument FILE with `testcover' and remember its definition symbols."
-  (let ((source (expand-file-name file cc-switch-coverage--root-directory))
+  (let ((source (expand-file-name file agent-switch-coverage--root-directory))
         symbols)
     (cl-letf (((symbol-function 'message)
                (lambda (&rest _args) nil)))
-      (let ((default-directory cc-switch-coverage--root-directory))
+      (let ((default-directory agent-switch-coverage--root-directory))
         (testcover-start source)))
     (setq symbols (mapcar #'car edebug-form-data))
     (push (cons file symbols)
-          cc-switch-coverage--instrumented)))
+          agent-switch-coverage--instrumented)))
 
-(defun cc-switch-coverage--entry-covered-p (entry)
+(defun agent-switch-coverage--entry-covered-p (entry)
   "Return non-nil if testcover ENTRY is considered covered."
   (or (eq entry 'edebug-ok-coverage)
       (memq (car-safe entry) '(testcover-1value maybe noreturn))))
 
-(defun cc-switch-coverage--symbol-summary (symbol)
+(defun agent-switch-coverage--symbol-summary (symbol)
   "Return (TOTAL COVERED UNCOVERED) for SYMBOL's coverage vector."
   (let ((coverage (get symbol 'edebug-coverage))
         (total 0)
@@ -57,13 +58,13 @@
     (when (vectorp coverage)
       (dotimes (index (length coverage))
         (setq total (1+ total))
-        (if (cc-switch-coverage--entry-covered-p
+        (if (agent-switch-coverage--entry-covered-p
              (aref coverage index))
             (setq covered (1+ covered))
           (setq uncovered (1+ uncovered)))))
     (list total covered uncovered)))
 
-(defun cc-switch-coverage--file-summary (file symbols)
+(defun agent-switch-coverage--file-summary (file symbols)
   "Return a plist coverage summary for FILE and SYMBOLS."
   (let ((defs 0)
         (total 0)
@@ -71,7 +72,7 @@
         (uncovered 0))
     (dolist (symbol symbols)
       (pcase-let ((`(,sym-total ,sym-covered ,sym-uncovered)
-                   (cc-switch-coverage--symbol-summary symbol)))
+                   (agent-switch-coverage--symbol-summary symbol)))
         (when (> sym-total 0)
           (setq defs (1+ defs))
           (setq total (+ total sym-total))
@@ -86,15 +87,15 @@
                        100.0
                      (* 100.0 (/ (float covered) total))))))
 
-(defun cc-switch-coverage--summaries ()
+(defun agent-switch-coverage--summaries ()
   "Return coverage summaries for all instrumented files."
   (mapcar (lambda (entry)
-            (cc-switch-coverage--file-summary
+            (agent-switch-coverage--file-summary
              (car entry)
              (cdr entry)))
-          (nreverse cc-switch-coverage--instrumented)))
+          (nreverse agent-switch-coverage--instrumented)))
 
-(defun cc-switch-coverage--total-summary (summaries)
+(defun agent-switch-coverage--total-summary (summaries)
   "Return total coverage summary for SUMMARIES."
   (let ((defs 0)
         (total 0)
@@ -114,7 +115,7 @@
                        100.0
                      (* 100.0 (/ (float covered) total))))))
 
-(defun cc-switch-coverage--format-summary (summary)
+(defun agent-switch-coverage--format-summary (summary)
   "Return a human-readable line for coverage SUMMARY."
   (format "%-24s defs=%3d forms=%5d covered=%5d missed=%5d %6.2f%%"
           (plist-get summary :file)
@@ -124,12 +125,12 @@
           (plist-get summary :uncovered)
           (plist-get summary :percent)))
 
-(defun cc-switch-coverage--write-tsv (summaries total)
+(defun agent-switch-coverage--write-tsv (summaries total)
   "Write SUMMARIES and TOTAL to the batch coverage TSV report."
-  (make-directory cc-switch-coverage-directory t)
+  (make-directory agent-switch-coverage-directory t)
   (let ((report (expand-file-name
                  "testcover-summary.tsv"
-                 cc-switch-coverage-directory)))
+                 agent-switch-coverage-directory)))
     (with-temp-file report
       (insert "file\tdefs\tforms\tcovered\tmissed\tpercent\n")
       (dolist (summary (append summaries (list total)))
@@ -143,34 +144,34 @@
                  (plist-get summary :percent)))))
     report))
 
-(defun cc-switch-coverage-run ()
+(defun agent-switch-coverage-run ()
   "Run ERT tests under `testcover' and write a coverage summary."
-  (setq cc-switch-coverage--instrumented nil)
-  (dolist (file cc-switch-coverage--source-files)
-    (cc-switch-coverage--instrument-file file))
-  (dolist (file cc-switch-coverage--test-files)
-    (load (expand-file-name file cc-switch-coverage--root-directory) nil t))
+  (setq agent-switch-coverage--instrumented nil)
+  (dolist (file agent-switch-coverage--source-files)
+    (agent-switch-coverage--instrument-file file))
+  (dolist (file agent-switch-coverage--test-files)
+    (load (expand-file-name file agent-switch-coverage--root-directory) nil t))
   (let* ((stats (ert-run-tests-batch t))
-         (summaries (cc-switch-coverage--summaries))
-         (total (cc-switch-coverage--total-summary summaries))
-         (report (cc-switch-coverage--write-tsv summaries total)))
+         (summaries (agent-switch-coverage--summaries))
+         (total (agent-switch-coverage--total-summary summaries))
+         (report (agent-switch-coverage--write-tsv summaries total)))
     (princ "\nCoverage summary:\n")
     (dolist (summary summaries)
-      (princ (concat (cc-switch-coverage--format-summary summary)
+      (princ (concat (agent-switch-coverage--format-summary summary)
                      "\n")))
-    (princ (concat (cc-switch-coverage--format-summary total)
+    (princ (concat (agent-switch-coverage--format-summary total)
                    "\n"))
     (princ (format "Coverage report: %s\n" report))
     (when (> (ert-stats-completed-unexpected stats) 0)
       (kill-emacs 1))
-    (when (< (plist-get total :percent) cc-switch-coverage-min)
+    (when (< (plist-get total :percent) agent-switch-coverage-min)
       (princ
        (format
         "Coverage %.2f%% is below required minimum %.2f%%\n"
         (plist-get total :percent)
-        (float cc-switch-coverage-min)))
+        (float agent-switch-coverage-min)))
       (kill-emacs 1))))
 
-(cc-switch-coverage-run)
+(agent-switch-coverage-run)
 
 ;;; coverage.el ends here

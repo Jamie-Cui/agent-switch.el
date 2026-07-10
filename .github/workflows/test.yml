@@ -29,7 +29,7 @@ jobs:
             --eval "(setq package-archives '((\"gnu\" . \"https://elpa.gnu.org/packages/\") (\"nongnu\" . \"https://elpa.nongnu.org/nongnu/\") (\"melpa\" . \"https://melpa.org/packages/\")))" \
             --eval "(package-initialize)" \
             --eval "(package-refresh-contents)" \
-            --eval "(dolist (pkg '(transient toml cond-let compat llama)) (unless (package-installed-p pkg) (package-install pkg)))"
+            --eval "(dolist (pkg '(transient toml tomelr cond-let compat llama gptel)) (unless (package-installed-p pkg) (package-install pkg)))"
 
       - name: Byte-compile
         run: make compile
