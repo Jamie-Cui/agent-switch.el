@@ -28,16 +28,15 @@
 
 (cl-defstruct (agent-switch-client
                (:constructor agent-switch--make-client))
-  id name adapter-id metadata)
+  id name adapter-id)
 
 (cl-defstruct (agent-switch-profile
                (:constructor agent-switch--make-profile))
-  id client-id name description payload ownership source source-hash
-  valid-p error metadata)
+  id client-id name payload ownership source source-hash valid-p error)
 
 (cl-defstruct (agent-switch-job
                (:constructor agent-switch-job-create))
-  starter canceler description)
+  starter canceler)
 
 (defvar agent-switch--adapters (make-hash-table :test #'equal)
   "Registered adapters keyed by string ID.")
@@ -58,10 +57,19 @@
   "Hook run after asynchronous Adapter data becomes available.")
 
 (defconst agent-switch--callback-keys
-  '(:current :activate :validate :discover :status :snapshot :rollback
-    :profile-current-p :capture-current :describe :watch-paths :watch-setup
-    :profile-template)
+  '(:current :activate :validate :discover :snapshot :rollback
+    :profile-current-p :watch-paths :watch-setup :profile-template)
   "Recognized adapter callback keys.")
+
+(defun agent-switch--validate-properties (properties allowed kind)
+  "Ensure PROPERTIES is a plist containing only ALLOWED keys for KIND."
+  (unless (zerop (% (length properties) 2))
+    (signal 'agent-switch-validation-error
+            (list (format "%s properties must be a plist" kind))))
+  (cl-loop for (key _value) on properties by #'cddr
+           unless (memq key allowed)
+           do (signal 'agent-switch-validation-error
+                      (list (format "Unsupported %s property: %s" kind key)))))
 
 (defun agent-switch--string-id (value kind)
   "Validate VALUE as a filesystem-safe ID for KIND and return it."
@@ -110,6 +118,8 @@ Signal when REQUIRED is non-nil and the callback is absent."
 
 Required callback properties are `:current' and `:activate'.  Optional
 callbacks are listed in `agent-switch--callback-keys'."
+  (agent-switch--validate-properties
+   properties (cons :name agent-switch--callback-keys) "adapter")
   (setq id (agent-switch--string-id id "adapter"))
   (let (callbacks)
     (dolist (key agent-switch--callback-keys)
@@ -150,6 +160,7 @@ When NOERROR is nil, signal if it is not registered."
 (defun agent-switch-register-client (id &rest properties)
   "Register a managed client ID using PROPERTIES.
 `:adapter' is required and may be a symbol or string adapter ID."
+  (agent-switch--validate-properties properties '(:adapter :name) "client")
   (setq id (agent-switch--string-id id "client"))
   (let* ((adapter-id (agent-switch--string-id
                       (plist-get properties :adapter) "adapter"))
@@ -157,8 +168,7 @@ When NOERROR is nil, signal if it is not registered."
          (client (agent-switch--make-client
                   :id id
                   :name (or (plist-get properties :name) id)
-                  :adapter-id adapter-id
-                  :metadata (plist-get properties :metadata))))
+                  :adapter-id adapter-id)))
     (unless (gethash id agent-switch--clients)
       (setq agent-switch--client-order
             (append agent-switch--client-order (list id))))
@@ -182,7 +192,9 @@ When NOERROR is nil, signal if it is not registered."
 
 (defun agent-switch-register-profile (client-id id &rest properties)
   "Register an external Elisp profile ID for CLIENT-ID.
-PROPERTIES accepts `:name', `:description', `:payload', and `:metadata'."
+PROPERTIES accepts `:name' and `:payload'."
+  (agent-switch--validate-properties
+   properties '(:name :payload) "profile")
   (setq client-id (agent-switch--string-id client-id "client"))
   (setq id (agent-switch--string-id id "profile"))
   (agent-switch-get-client client-id)
@@ -190,13 +202,11 @@ PROPERTIES accepts `:name', `:description', `:payload', and `:metadata'."
                   :id id
                   :client-id client-id
                   :name (or (plist-get properties :name) id)
-                  :description (plist-get properties :description)
                   :payload (or (plist-get properties :payload)
                                (make-hash-table :test #'equal))
                   :ownership 'external
                   :source 'elisp
-                  :valid-p t
-                  :metadata (plist-get properties :metadata))))
+                  :valid-p t)))
     (puthash (cons client-id id) profile agent-switch--external-profiles)
     profile))
 
@@ -211,11 +221,6 @@ PROPERTIES accepts `:name', `:description', `:payload', and `:metadata'."
     (sort profiles (lambda (a b)
                      (string-lessp (agent-switch-profile-id a)
                                    (agent-switch-profile-id b))))))
-
-(defun agent-switch-profile-reference (profile)
-  "Return stable (CLIENT-ID . PROFILE-ID) reference for PROFILE."
-  (cons (agent-switch-profile-client-id profile)
-        (agent-switch-profile-id profile)))
 
 (defun agent-switch-job-start (job on-success on-failure)
   "Start JOB, calling ON-SUCCESS or ON-FAILURE exactly once."
@@ -238,17 +243,6 @@ PROPERTIES accepts `:name', `:description', `:payload', and `:metadata'."
   (when-let* ((cancel (and (agent-switch-job-p job)
                            (agent-switch-job-canceler job))))
     (funcall cancel)))
-
-(defun agent-switch--settle-result (thunk on-success on-failure)
-  "Run THUNK and settle its value through callbacks.
-If THUNK returns an `agent-switch-job', start it.  Call ON-SUCCESS with
-the value or ON-FAILURE with the error."
-  (condition-case error-value
-      (let ((result (funcall thunk)))
-        (if (agent-switch-job-p result)
-            (agent-switch-job-start result on-success on-failure)
-          (funcall on-success result)))
-    (error (funcall on-failure error-value))))
 
 (defun agent-switch-call (client callback-key &rest arguments)
   "Call CLIENT adapter CALLBACK-KEY with ARGUMENTS.
@@ -296,15 +290,6 @@ The CLIENT object is prepended to ARGUMENTS.  Return a direct value or Job."
       (agent-switch--json-value-equal-p
        (agent-switch-profile-payload profile) current))))
 
-(defun agent-switch-reset-registries ()
-  "Clear all registries.
-This is primarily useful to isolate tests and reload built-in adapters."
-  (interactive)
-  (clrhash agent-switch--adapters)
-  (clrhash agent-switch--clients)
-  (clrhash agent-switch--external-profiles)
-  (setq agent-switch--client-order nil))
-
 ;; Storage-owned functions are declared here to keep the activation protocol
 ;; usable without introducing a circular require.
 (declare-function agent-switch-profiles "agent-switch-storage" (client-id))
@@ -347,9 +332,6 @@ INTERACTIVEP is recorded in the adapter context."
          (active-child nil)
          (resolved-secrets nil))
     (agent-switch-job-create
-     :description (format "Activate %s/%s"
-                          (agent-switch-client-id client)
-                          (agent-switch-profile-id profile))
      :canceler (lambda ()
                (setq cancelled t)
                (when (agent-switch-job-p active-child)
@@ -369,7 +351,7 @@ INTERACTIVEP is recorded in the adapter context."
                                         (agent-switch--safe-error-message
                                          error-value))))))
               (settle
-               (_stage thunk success failure)
+               (thunk success failure)
                (if cancelled
                    (funcall failure '(quit "Activation cancelled"))
                  (condition-case error-value
@@ -383,8 +365,7 @@ INTERACTIVEP is recorded in the adapter context."
               (roll-back
                (stage error-value)
                (if (and snapshot rollback)
-                   (settle "rollback"
-                           (lambda ()
+                   (settle (lambda ()
                              (funcall rollback client snapshot context))
                            (lambda (_value) (reject-safe stage error-value))
                            (lambda (rollback-error)
@@ -411,8 +392,7 @@ INTERACTIVEP is recorded in the adapter context."
                  (error (roll-back "state commit" error-value))))
               (verify
                ()
-               (settle "verification"
-                       (lambda () (funcall current-fn client context))
+               (settle (lambda () (funcall current-fn client context))
                        (lambda (current)
                          (if (agent-switch-profile-current-p
                               client resolved-profile current context)
@@ -425,8 +405,7 @@ INTERACTIVEP is recorded in the adapter context."
                          (roll-back "verification" error-value))))
               (activate-profile
                ()
-               (settle "activation"
-                       (lambda ()
+               (settle (lambda ()
                          (funcall activate client resolved-profile context))
                        (lambda (_value) (verify))
                        (lambda (error-value)
@@ -434,8 +413,7 @@ INTERACTIVEP is recorded in the adapter context."
               (take-snapshot
                ()
                (if snapshot-fn
-                   (settle "snapshot"
-                           (lambda ()
+                   (settle (lambda ()
                              (funcall snapshot-fn client profile context))
                            (lambda (value)
                              (setq snapshot value)
@@ -455,8 +433,7 @@ INTERACTIVEP is recorded in the adapter context."
               (validate-profile
                ()
                (if validate
-                   (settle "validation"
-                           (lambda ()
+                   (settle (lambda ()
                              (funcall validate client profile context))
                            (lambda (_value) (resolve-secrets))
                            (lambda (error-value)

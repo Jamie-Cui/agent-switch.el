@@ -11,10 +11,9 @@
 ;;; Code:
 
 (require 'auth-source)
+(require 'cl-lib)
 (require 'json)
-(require 'map)
 (require 'rx)
-(require 'seq)
 (require 'subr-x)
 (require 'agent-switch-core)
 
@@ -155,11 +154,11 @@ When CREATE-PARENT is non-nil, create the parent directory."
   "Restore file STATE captured by `agent-switch-capture-file'."
   (let ((path (agent-switch-file-state-path state)))
     (if (agent-switch-file-state-exists-p state)
-        (let ((current-hash (agent-switch--current-file-hash path)))
-          (agent-switch-write-text-atomic
-           path (agent-switch-file-state-content state) current-hash t))
-      (when (file-exists-p path)
-        (delete-file path)))))
+        (agent-switch-write-text-atomic
+         path (agent-switch-file-state-content state)
+         (agent-switch-file-state-hash state) t)
+      (agent-switch-delete-file-optimistic
+       path (agent-switch-file-state-hash state)))))
 
 (defun agent-switch-parse-json (text &optional context)
   "Parse JSON TEXT as hash-table data.
@@ -211,42 +210,6 @@ CONTEXT is included in sanitized parse errors."
          patch)
         result)
     (agent-switch-json-copy patch)))
-
-(defun agent-switch-json-get-in (object path &optional default)
-  "Return nested OBJECT value at string key PATH, or DEFAULT."
-  (let ((value object)
-        (missing (make-symbol "missing")))
-    (catch 'missing
-      (dolist (key path)
-        (unless (hash-table-p value)
-          (throw 'missing default))
-        (setq value (gethash key value missing))
-        (when (eq value missing)
-          (throw 'missing default)))
-      value)))
-
-(defun agent-switch-json-put-in (object path value)
-  "Set nested OBJECT string key PATH to VALUE and return OBJECT."
-  (unless path
-    (signal 'agent-switch-validation-error '("JSON path cannot be empty")))
-  (let ((cursor object))
-    (dolist (key (butlast path))
-      (let ((child (gethash key cursor)))
-        (unless (hash-table-p child)
-          (setq child (make-hash-table :test #'equal))
-          (puthash key child cursor))
-        (setq cursor child)))
-    (puthash (car (last path)) value cursor))
-  object)
-
-(defun agent-switch-json-remove-in (object path)
-  "Remove nested key PATH from OBJECT."
-  (let ((cursor object))
-    (dolist (key (butlast path))
-      (setq cursor (and (hash-table-p cursor) (gethash key cursor))))
-    (when (hash-table-p cursor)
-      (remhash (car (last path)) cursor)))
-  object)
 
 (defun agent-switch-secret-reference-p (value)
   "Return non-nil when VALUE is a supported secret reference object."
@@ -379,8 +342,6 @@ PATH is used internally to identify sensitive keys without exposing values."
     (puthash "id" (agent-switch-profile-id profile) object)
     (puthash "client" (agent-switch-profile-client-id profile) object)
     (puthash "name" (agent-switch-profile-name profile) object)
-    (when-let* ((description (agent-switch-profile-description profile)))
-      (puthash "description" description object))
     (puthash "payload" (agent-switch-profile-payload profile) object)
     object))
 
@@ -409,7 +370,6 @@ PATH is used internally to identify sensitive keys without exposing values."
     (agent-switch-validate-no-plaintext-secrets payload)
     (agent-switch--make-profile
      :id id :client-id client-id :name name
-     :description (gethash "description" object)
      :payload payload :ownership 'managed :source path :source-hash hash
      :valid-p t)))
 
@@ -420,7 +380,6 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
    :id (file-name-base path)
    :client-id client-id
    :name (file-name-base path)
-   :description nil
    :payload (make-hash-table :test #'equal)
    :ownership 'managed
    :source path
@@ -508,30 +467,16 @@ Asynchronous discovery is cached and announces completion through
              agent-switch--discovery-cache)
     (clrhash agent-switch--discovery-cache)))
 
-(defun agent-switch--ordered-profiles (client-id profiles)
-  "Order PROFILES for CLIENT-ID using state preferences."
-  (let* ((order (agent-switch-state-profile-order client-id))
-         (index (make-hash-table :test #'equal)))
-    (cl-loop for id in order for position from 0
-             do (puthash id position index))
-    (sort profiles
-          (lambda (left right)
-            (let ((left-index (gethash (agent-switch-profile-id left) index))
-                  (right-index (gethash (agent-switch-profile-id right) index)))
-              (cond
-               ((and left-index right-index) (< left-index right-index))
-               (left-index t)
-               (right-index nil)
-               (t (string-lessp (agent-switch-profile-id left)
-                                 (agent-switch-profile-id right)))))))))
-
 (defun agent-switch-profiles (client-id)
-  "Return managed and external profiles for CLIENT-ID in display order."
+  "Return managed and external profiles for CLIENT-ID ordered by ID."
   (let* ((client (agent-switch-get-client client-id))
          (profiles (append (agent-switch-load-managed-profiles client-id)
                            (agent-switch-external-profiles client-id)
                            (agent-switch--adapter-discovered-profiles client))))
-    (agent-switch--ordered-profiles client-id profiles)))
+    (sort profiles
+          (lambda (left right)
+            (string-lessp (agent-switch-profile-id left)
+                          (agent-switch-profile-id right))))))
 
 (defun agent-switch-find-profile (client-id profile-id &optional noerror)
   "Return CLIENT-ID PROFILE-ID.
@@ -584,20 +529,12 @@ When NOERROR is non-nil, return nil on absence."
    (agent-switch-profile-client-id profile)
    (agent-switch-profile-id profile)))
 
-(defun agent-switch-profile-payload-fingerprint (profile-or-payload)
-  "Return a stable fingerprint for PROFILE-OR-PAYLOAD."
-  (let ((payload (if (agent-switch-profile-p profile-or-payload)
-                     (agent-switch-profile-payload profile-or-payload)
-                   profile-or-payload)))
-    (agent-switch-content-hash (agent-switch-json-serialize payload))))
-
 (defun agent-switch--empty-state ()
   "Return a new versioned state object."
   (let ((object (make-hash-table :test #'equal)))
     (puthash "schema_version" agent-switch-storage-schema-version object)
     (puthash "last_selected" (make-hash-table :test #'equal) object)
     (puthash "applied_profiles" (make-hash-table :test #'equal) object)
-    (puthash "profile_order" (make-hash-table :test #'equal) object)
     (puthash "unprotected_confirmed" [] object)
     (puthash "canonical_confirmations" (make-hash-table :test #'equal) object)
     object))
@@ -679,8 +616,6 @@ When NOERROR is non-nil, return nil on absence."
                          (let ((new (make-hash-table :test #'equal)))
                            (puthash "applied_profiles" new data)
                            new))))
-       (puthash "fingerprint"
-                (agent-switch-profile-payload-fingerprint profile) snapshot)
        (puthash "payload" (agent-switch-json-copy
                            (agent-switch-profile-payload profile)) snapshot)
        (puthash client-id profile-id selected)
@@ -692,37 +627,12 @@ When NOERROR is non-nil, return nil on absence."
          (applied (gethash "applied_profiles" data)))
     (and (hash-table-p applied) (gethash client-id applied))))
 
-(defun agent-switch-state-profile-order (client-id)
-  "Return saved profile order for CLIENT-ID."
-  (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
-         (orders (gethash "profile_order" data))
-         (order (and (hash-table-p orders) (gethash client-id orders))))
-    (cond ((vectorp order) (append order nil))
-          ((listp order) order)
-          (t nil))))
-
-(defun agent-switch-state-set-profile-order (client-id profile-ids)
-  "Persist PROFILE-IDS display order for CLIENT-ID."
-  (agent-switch-update-state
-   (lambda (data)
-     (let ((orders (or (gethash "profile_order" data)
-                       (let ((new (make-hash-table :test #'equal)))
-                         (puthash "profile_order" new data)
-                         new))))
-       (puthash client-id (vconcat profile-ids) orders)))))
-
 (defun agent-switch-state-remove-profile (client-id profile-id)
   "Remove PROFILE-ID references for CLIENT-ID from state."
   (agent-switch-update-state
    (lambda (data)
-     (let ((orders (gethash "profile_order" data))
-           (last-selected (gethash "last_selected" data))
+     (let ((last-selected (gethash "last_selected" data))
            (applied (gethash "applied_profiles" data)))
-       (when (hash-table-p orders)
-         (let ((order (gethash client-id orders)))
-           (puthash client-id
-                    (vconcat (delete profile-id (append order nil)))
-                    orders)))
        (when (and (hash-table-p last-selected)
                   (equal (gethash client-id last-selected) profile-id))
          (remhash client-id last-selected)

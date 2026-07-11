@@ -1,7 +1,6 @@
 # agent-switch.el
 
 [![Test](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/test.yml/badge.svg)](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/test.yml)
-[![Coverage](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/coverage.yml/badge.svg)](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/coverage.yml)
 [![Melpazoid](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/melpazoid.yml/badge.svg)](https://github.com/Jamie-Cui/agent-switch.el/actions/workflows/melpazoid.yml)
 
 `agent-switch.el` is an Emacs control panel for selecting provider profiles
@@ -37,22 +36,16 @@ Open the dashboard with `M-x agent-switch`.
 The dashboard uses an internal section model and derives from `special-mode`.
 It does not depend on `magit-section` or `tabulated-list-mode`.
 Always-visible status lines appear directly at the top, followed by the
-collapsible Client and Profile sections.
-Client headings use compact disclosure indicators and align status text in a
-separate column; customize the name column with
-`agent-switch-client-name-width`.
-The innermost section at point is highlighted across its full visible range,
-including expanded detail lines. Customize the appearance with
-`agent-switch-section-highlight`, or disable it by setting
-`agent-switch-highlight-current-section` to `nil`.
+collapsible Client sections and single-line Profile rows.
+Client headings show inline status text.
+The standard `hl-line-mode` highlights the row at point.
 
 Common keys in Evil and non-Evil sessions:
 
 | Key | Action |
 | --- | --- |
-| `TAB` | Expand or collapse the section at point |
-| `S-TAB` | Cycle all sections through collapsed, default, and expanded |
-| `RET` | Open Profile details, or toggle a Client section |
+| `TAB` | Expand or collapse a Client |
+| `RET` | Edit a Profile, or toggle a Client section |
 | `?` | Open the transient action menu |
 | `q` | Quit the dashboard window |
 
@@ -62,29 +55,19 @@ Additional non-Evil keys:
 | --- | --- |
 | `g` | Refresh |
 | `n` / `p` | Next / previous section |
-| `M-n` / `M-p` | Next / previous sibling section |
 
-In Evil normal state, `g`, `n/p`, and `M-n/M-p` keep their native Evil
-behavior. The package deliberately does not add `gr`, `C-j/C-k`, or `gj/gk`
-alternatives.
+In Evil normal state, `g` and `n/p` keep their native Evil behavior. The
+package deliberately does not add `gr`, `C-j/C-k`, or `gj/gk` alternatives.
 
-The `?` menu contains Apply, New, Copy, Edit, Delete, and reorder actions.
+The `?` menu contains Apply, New, Copy, Edit, Delete, refresh, and diagnostics.
 Edit visits the managed Profile JSON using the user's normal Emacs file mode.
 Editing and saving never applies a Profile automatically; Apply is always
 explicit. Operation failures are logged through `message` to `*Messages*` and
 are not retained in the dashboard status preamble.
 
-When a Client has live configuration but no managed, external, or discovered
-Profiles, opening the dashboard captures that configuration as the managed
-`Default` Profile. Adoption only writes agent-switch's Profile and state files;
-it does not apply or rewrite the Client configuration. If the live state
-contains redacted secrets that cannot be persisted safely, the dashboard
-instead shows `default setup required`. Use New and add secret references to
-finish setup.
-
-Third-party Adapters participate in automatic initialization when they provide
-a synchronous `:capture-current` callback. Adapters without that capability
-continue to show `No profiles` until a Profile is created or registered.
+Opening the dashboard never creates a Profile or writes configuration. A Client
+without managed, external, or discovered Profiles shows `No profiles`; use New
+to create one explicitly.
 
 ## Built-in Clients
 
@@ -141,8 +124,8 @@ Customize it with:
 ```
 
 Each managed Profile has its own versioned JSON file. `state.json` stores only
-last selections, Profile display order, recovery confirmations, and similar
-small state. Section visibility is buffer-local and is not persisted.
+last selections, applied payload snapshots, recovery confirmations, and similar
+small state. Client visibility is buffer-local and is not persisted.
 
 Profile identity is `(client-id, profile-id)`, so different Clients may reuse
 the same Profile ID.
@@ -170,7 +153,7 @@ or:
 ```
 
 References are resolved only during activation. Resolved values are excluded
-from Profile/state files, dashboard details, diagnostics, and sanitized error
+from Profile/state files, the dashboard, diagnostics, and sanitized error
 messages.
 
 ## Safety Model
@@ -191,7 +174,8 @@ as unprotected and require confirmation before first activation.
 File writes compare the content hash captured at read time immediately before
 an atomic same-directory rename. If another process changes a file, the write
 is aborted; agent-switch never automatically merges or overwrites the external
-change.
+change. Rollback uses the hash produced by agent-switch's own write and also
+refuses to overwrite a later external change.
 
 A damaged Profile file is shown as a disabled error item without blocking
 other Profiles. A damaged `state.json` is treated as empty, read-only state
@@ -200,8 +184,9 @@ until the user explicitly resets it; reset first keeps a timestamped copy.
 ## Elisp Extensions
 
 Adapters use a declarative callback protocol. `:current` and `:activate` are
-required; validation, discovery, status, snapshot, rollback, matching,
-capture-current, details, and watchers are optional capabilities.
+required. Optional capabilities are `:validate`, `:discover`, `:snapshot`,
+`:rollback`, `:profile-current-p`, `:watch-paths`, `:watch-setup`, and
+`:profile-template`.
 
 ```elisp
 (agent-switch-define-adapter my-agent
@@ -239,16 +224,14 @@ Callbacks may return a value directly or return an `agent-switch-job` for
 asynchronous process/network work. The dashboard tracks pending Jobs, ignores
 stale generations, and uses optional Job cancellation during cleanup.
 
-Managed Create/Edit is generated from an Adapter's `:profile-fields` schema.
-The core supports string, integer, boolean, choice, string-list, and
-secret-reference fields. Complex Adapters may provide a custom editor instead.
+Managed Create starts from the Adapter's optional `:profile-template` JSON
+object. Edit visits the Profile JSON file directly.
 
 ## Development
 
 ```sh
 make compile
 make test
-make coverage
 ```
 
 ## License

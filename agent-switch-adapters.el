@@ -11,7 +11,6 @@
 
 (require 'cl-lib)
 (require 'diff)
-(require 'seq)
 (require 'subr-x)
 (require 'agent-switch-core)
 (require 'agent-switch-storage)
@@ -21,7 +20,6 @@
 (declare-function gptel-get-backend "gptel-request")
 (declare-function tomelr-encode "tomelr")
 (declare-function toml:read-from-string "toml")
-(defvar gptel--known-backends)
 
 (defcustom agent-switch-claude-config-directory
   (expand-file-name "~/.claude/")
@@ -111,8 +109,9 @@ opencode.json below XDG_CONFIG_HOME or ~/.config."
   "Back up and atomically write TEXT to PATH using CONTEXT snapshot."
   (let ((state (agent-switch--context-file-state context path)))
     (agent-switch-backup-file path)
-    (agent-switch-write-text-atomic
-     path text (agent-switch-file-state-hash state) t)))
+    (setf (agent-switch-file-state-hash state)
+          (agent-switch-write-text-atomic
+           path text (agent-switch-file-state-hash state) t))))
 
 (defun agent-switch--write-live-json (path object context)
   "Back up and atomically write JSON OBJECT to PATH using CONTEXT."
@@ -194,26 +193,6 @@ secret markers exactly."
                           (aref expected index) (aref actual index)))))
    (t (equal expected actual))))
 
-(defun agent-switch--remove-secret-markers (value)
-  "Return a copy of VALUE without secret marker fields."
-  (cond
-   ((hash-table-p value)
-    (let ((copy (make-hash-table :test #'equal)))
-      (maphash (lambda (key child)
-                 (unless (agent-switch--secret-marker-p child)
-                   (puthash key (agent-switch--remove-secret-markers child) copy)))
-               value)
-      copy))
-   ((vectorp value)
-    (vconcat (mapcar #'agent-switch--remove-secret-markers
-                     (append value nil))))
-   ((consp value) (mapcar #'agent-switch--remove-secret-markers value))
-   (t value)))
-
-(defun agent-switch--capture-current (_client current _context)
-  "Return CURRENT as a managed Profile payload without secret markers."
-  (agent-switch--remove-secret-markers current))
-
 ;;; Claude Code
 
 (defun agent-switch--claude-owned-state (settings)
@@ -288,10 +267,6 @@ Return nil when no ANTHROPIC_* keys are configured."
 (defun agent-switch--claude-watch-paths (_client _context)
   "Return paths watched for Claude changes."
   (list (agent-switch--claude-settings-path)))
-
-(defun agent-switch--claude-describe (_client _profile _context)
-  "Return secret-safe Claude target information."
-  (list (cons "Writes" (agent-switch--claude-settings-path))))
 
 ;;; TOML helpers and Codex
 
@@ -528,11 +503,6 @@ CONTEXT determines whether an interactive confirmation is available."
   "Return paths watched for Codex changes."
   (list (agent-switch--codex-config-path)))
 
-(defun agent-switch--codex-describe (_client _profile _context)
-  "Return secret-safe Codex target information."
-  (list (cons "Writes" (agent-switch--codex-config-path))
-        (cons "Format" "canonical TOML; comments/order are not preserved")))
-
 ;;; gptel defaults
 
 (defun agent-switch--ensure-gptel ()
@@ -563,20 +533,6 @@ Return nil when no backend is configured."
   (mapcar (lambda (model)
             (if (symbolp model) (symbol-name model) (format "%s" model)))
           (gptel-backend-models (gptel-get-backend backend-name))))
-
-(defun agent-switch--gptel-backend-choices (_client _profile)
-  "Return registered gptel backend names for editor choices."
-  (agent-switch--ensure-gptel)
-  (mapcar #'car gptel--known-backends))
-
-(defun agent-switch--gptel-model-choices (_client profile)
-  "Return model choices for gptel PROFILE backend."
-  (let ((backend-name (agent-switch-json-get-in
-                       (agent-switch-profile-payload profile)
-                       '("backend-name"))))
-    (if (and backend-name (not (string-empty-p backend-name)))
-        (agent-switch--gptel-models-for-backend backend-name)
-      nil)))
 
 (defun agent-switch--gptel-validate (_client profile _context)
   "Validate gptel PROFILE references."
@@ -619,11 +575,6 @@ Return nil when no backend is configured."
 (defun agent-switch--gptel-profile-current-p (_client profile current _context)
   "Return non-nil when gptel PROFILE matches CURRENT defaults."
   (agent-switch--json-subset-p (agent-switch-profile-payload profile) current))
-
-(defun agent-switch--gptel-describe (_client _profile _context)
-  "Return gptel scope information."
-  (list (cons "Scope" "global defaults only")
-        (cons "Variables" "gptel-backend, gptel-model")))
 
 (defun agent-switch--gptel-watch-setup (_client callback)
   "Watch gptel default variables and invoke CALLBACK after changes.
@@ -811,11 +762,6 @@ Return nil when no model is configured."
   "Return paths watched for OpenCode global changes."
   (list (agent-switch--opencode-config-path)))
 
-(defun agent-switch--opencode-describe (_client _profile _context)
-  "Return secret-safe OpenCode target information."
-  (list (cons "Writes" (agent-switch--opencode-config-path))
-        (cons "Scope" "global config only; project/session overrides are preserved")))
-
 ;;; Registration
 
 (defun agent-switch--template-object (&rest entries)
@@ -865,9 +811,7 @@ Return nil when no model is configured."
     :snapshot #'agent-switch--claude-snapshot
     :rollback #'agent-switch--rollback-files
     :profile-current-p #'agent-switch--claude-profile-current-p
-    :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--claude-watch-paths
-    :describe #'agent-switch--claude-describe
     :profile-template #'agent-switch--claude-profile-template)
   (agent-switch-register-client 'claude :name "Claude Code" :adapter 'claude)
 
@@ -879,9 +823,7 @@ Return nil when no model is configured."
     :snapshot #'agent-switch--codex-snapshot
     :rollback #'agent-switch--rollback-files
     :profile-current-p #'agent-switch--codex-profile-current-p
-    :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--codex-watch-paths
-    :describe #'agent-switch--codex-describe
     :profile-template #'agent-switch--codex-profile-template)
   (agent-switch-register-client 'codex :name "Codex" :adapter 'codex)
 
@@ -893,9 +835,7 @@ Return nil when no model is configured."
     :snapshot #'agent-switch--gptel-snapshot
     :rollback #'agent-switch--gptel-rollback
     :profile-current-p #'agent-switch--gptel-profile-current-p
-    :capture-current #'agent-switch--capture-current
     :watch-setup #'agent-switch--gptel-watch-setup
-    :describe #'agent-switch--gptel-describe
     :profile-template #'agent-switch--gptel-profile-template)
   (agent-switch-register-client 'gptel-default
                                 :name "gptel Default"
@@ -909,9 +849,7 @@ Return nil when no model is configured."
     :snapshot #'agent-switch--opencode-snapshot
     :rollback #'agent-switch--rollback-files
     :profile-current-p #'agent-switch--opencode-profile-current-p
-    :capture-current #'agent-switch--capture-current
     :watch-paths #'agent-switch--opencode-watch-paths
-    :describe #'agent-switch--opencode-describe
     :profile-template #'agent-switch--opencode-profile-template)
   (agent-switch-register-client 'opencode-global
                                 :name "OpenCode Global"

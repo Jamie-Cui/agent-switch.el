@@ -10,9 +10,6 @@
 # Built distribution
 dist/
 
-# Test coverage
-coverage/
-
 # Backup files
 *~
 
