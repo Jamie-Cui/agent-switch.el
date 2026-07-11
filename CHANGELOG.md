@@ -23,4 +23,10 @@
   navigation/search keys.
 - Added managed Profile CRUD, external Profile registration/copying, widget
   editing, Profile ordering, semantic faces, file watchers, and diagnostics.
+- Added per-Client `Default` Profile initialization from secret-safe live
+  configuration and removed Import Current from the transient menu.
+- Normalized missing Codex provider tables to empty Profile objects so capture,
+  persistence, status matching, and activation verification agree.
+- Moved operation failure details out of the dashboard and into `*Messages*`,
+  and rendered the dashboard data path with the default face.
 - Licensed the package under GPL-3.0-or-later with SPDX headers.

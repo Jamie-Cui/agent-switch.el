@@ -68,10 +68,23 @@ In Evil normal state, `g`, `n/p`, and `M-n/M-p` keep their native Evil
 behavior. The package deliberately does not add `gr`, `C-j/C-k`, or `gj/gk`
 alternatives.
 
-The `?` menu contains Apply, New, Copy, Edit, Import Current, Delete, and
-reorder actions. Edit visits the managed Profile JSON using the user's normal
-Emacs file mode. Editing and saving never applies a Profile automatically;
-Apply is always explicit.
+The `?` menu contains Apply, New, Copy, Edit, Delete, and reorder actions.
+Edit visits the managed Profile JSON using the user's normal Emacs file mode.
+Editing and saving never applies a Profile automatically; Apply is always
+explicit. Operation failures are logged through `message` to `*Messages*` and
+are not retained in the dashboard status preamble.
+
+When a Client has live configuration but no managed, external, or discovered
+Profiles, opening the dashboard captures that configuration as the managed
+`Default` Profile. Adoption only writes agent-switch's Profile and state files;
+it does not apply or rewrite the Client configuration. If the live state
+contains redacted secrets that cannot be persisted safely, the dashboard
+instead shows `default setup required`. Use New and add secret references to
+finish setup.
+
+Third-party Adapters participate in automatic initialization when they provide
+a synchronous `:capture-current` callback. Adapters without that capability
+continue to show `No profiles` until a Profile is created or registered.
 
 ## Built-in Clients
 

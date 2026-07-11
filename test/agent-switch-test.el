@@ -264,6 +264,212 @@
                              (agent-switch-profiles "async-client"))
                      '("remote"))))))
 
+(ert-deftest agent-switch-dashboard-initializes-current-config-as-default ()
+  (agent-switch-test--with-root root
+    (let ((activations 0)
+          (captures 0)
+          (current (agent-switch-test--hash "model" "live")))
+      (agent-switch-define-adapter bootstrap-adapter
+        :current (lambda (_client _context) current)
+        :activate (lambda (_client _profile _context)
+                    (setq activations (1+ activations)))
+        :validate (lambda (_client profile _context)
+                    (unless (equal (gethash "model"
+                                            (agent-switch-profile-payload profile))
+                                   "live")
+                      (signal 'agent-switch-validation-error
+                              '("Unexpected bootstrap payload")))
+                    t)
+        :capture-current (lambda (_client value _context)
+                           (setq captures (1+ captures))
+                           (agent-switch-json-copy value)))
+      (let ((client (agent-switch-register-client
+                     'bootstrap-client :adapter 'bootstrap-adapter)))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let* ((view (agent-switch--client-view client))
+                 (profile (car (agent-switch-client-view-profiles view))))
+            (should-not (agent-switch-client-view-error view))
+            (should (equal (gethash "model"
+                                    (agent-switch-client-view-current view))
+                           "live"))
+            (should profile)
+            (should (equal (agent-switch-profile-id profile) "default"))
+            (should (equal (agent-switch-profile-name profile) "Default"))
+            (should (eq (agent-switch-profile-ownership profile) 'managed))
+            (should (file-exists-p (agent-switch-profile-source profile)))
+            (should (eq profile
+                        (agent-switch-client-view-current-profile view)))
+            (should (equal (agent-switch-client-view-last-selected view)
+                           "default"))
+            (should (equal (agent-switch-state-last-selected
+                            "bootstrap-client")
+                           "default"))
+            (should (= captures 1))
+            (should (= activations 0))))))))
+
+(ert-deftest agent-switch-dashboard-does-not-bootstrap-over-existing-profile ()
+  (agent-switch-test--with-root root
+    (let ((captures 0)
+          (current (agent-switch-test--hash "model" "existing")))
+      (agent-switch-define-adapter existing-adapter
+        :current (lambda (_client _context) current)
+        :activate (lambda (_client _profile _context) t)
+        :capture-current (lambda (_client value _context)
+                           (setq captures (1+ captures))
+                           (agent-switch-json-copy value)))
+      (let* ((client (agent-switch-register-client
+                      'existing-client :adapter 'existing-adapter))
+             (existing (agent-switch-save-profile
+                        (agent-switch-test--profile
+                         "existing-client" "existing" current "Existing"))))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let ((view (agent-switch--client-view client)))
+            (should (equal
+                     (mapcar #'agent-switch-profile-id
+                             (agent-switch-client-view-profiles view))
+                     (list (agent-switch-profile-id existing))))
+            (should (= captures 0))
+            (should-not (file-exists-p
+                         (agent-switch-profile-path
+                          "existing-client" "default")))))))))
+
+(ert-deftest agent-switch-dashboard-requires-setup-when-current-has-secrets ()
+  (agent-switch-test--with-root root
+    (let ((captures 0)
+          (current
+           (agent-switch-test--hash
+            "env" (agent-switch-test--hash
+                   "BASE_URL" "https://secret.test"
+                   "API_TOKEN" (agent-switch--secret-marker "secret")))))
+      (agent-switch-define-adapter secret-bootstrap-adapter
+        :current (lambda (_client _context) current)
+        :activate (lambda (_client _profile _context) t)
+        :capture-current (lambda (_client value _context)
+                           (setq captures (1+ captures))
+                           (agent-switch-json-copy value)))
+      (let ((client (agent-switch-register-client
+                     'secret-bootstrap-client
+                     :adapter 'secret-bootstrap-adapter)))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let ((view (agent-switch--client-view client)))
+            (should-not (agent-switch-client-view-profiles view))
+            (should (eq (agent-switch-client-view-bootstrap-status view)
+                        'secret-required))
+            (should (string-match-p
+                     "default setup required"
+                     (substring-no-properties
+                      (agent-switch--client-status view))))
+            (should (= captures 0))
+            (should-not (file-exists-p
+                         (agent-switch-profile-path
+                          "secret-bootstrap-client" "default")))))))))
+
+(ert-deftest agent-switch-dashboard-does-not-bootstrap-with-damaged-state ()
+  (agent-switch-test--with-root root
+    (make-directory (agent-switch--directory) t)
+    (write-region "not-json" nil (agent-switch-state-path))
+    (let ((captures 0))
+      (agent-switch-define-adapter damaged-state-adapter
+        :current (lambda (_client _context)
+                   (agent-switch-test--hash "model" "live"))
+        :activate (lambda (_client _profile _context) t)
+        :capture-current (lambda (_client value _context)
+                           (setq captures (1+ captures))
+                           (agent-switch-json-copy value)))
+      (let ((client (agent-switch-register-client
+                     'damaged-state-client :adapter 'damaged-state-adapter)))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let ((view (agent-switch--client-view client)))
+            (should-not (agent-switch-client-view-profiles view))
+            (should (= captures 0))
+            (should-not (file-exists-p
+                         (agent-switch-profile-path
+                          "damaged-state-client" "default")))))))))
+
+(ert-deftest agent-switch-dashboard-reports-invalid-bootstrap-capture ()
+  (agent-switch-test--with-root root
+    (agent-switch-define-adapter invalid-capture-adapter
+      :current (lambda (_client _context)
+                 (agent-switch-test--hash "model" "live"))
+      :activate (lambda (_client _profile _context) t)
+      :capture-current (lambda (_client _value _context) nil))
+    (let ((client (agent-switch-register-client
+                   'invalid-capture-client :adapter 'invalid-capture-adapter)))
+      (with-temp-buffer
+        (agent-switch-mode)
+        (let ((view (agent-switch--client-view client)))
+          (should (string-match-p
+                   "capture-current must return a Profile payload object"
+                   (agent-switch-client-view-error view)))
+          (should-not (file-exists-p
+                       (agent-switch-profile-path
+                        "invalid-capture-client" "default"))))))))
+
+(ert-deftest agent-switch-dashboard-waits-for-discovered-profiles-before-bootstrap ()
+  (agent-switch-test--with-root root
+    (let ((captures 0)
+          (discovered
+           (agent-switch--make-profile
+            :id "remote" :client-id "discovered-client" :name "Remote"
+            :payload (agent-switch-test--hash "model" "remote")
+            :ownership 'external :source 'adapter :valid-p t)))
+      (agent-switch-define-adapter discovered-adapter
+        :current (lambda (_client _context)
+                   (agent-switch-test--hash "model" "remote"))
+        :activate (lambda (_client _profile _context) t)
+        :capture-current (lambda (_client value _context)
+                           (setq captures (1+ captures))
+                           (agent-switch-json-copy value))
+        :discover (lambda (_client _context)
+                    (agent-switch-job-create
+                     :starter (lambda (resolve _reject)
+                                (funcall resolve (list discovered))))))
+      (let ((client (agent-switch-register-client
+                     'discovered-client :adapter 'discovered-adapter)))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let ((view (agent-switch--client-view client)))
+            (should (equal
+                     (mapcar #'agent-switch-profile-id
+                             (agent-switch-client-view-profiles view))
+                     '("remote")))
+            (should (= captures 0))
+            (should-not (file-exists-p
+                         (agent-switch-profile-path
+                          "discovered-client" "default")))))))))
+
+(ert-deftest agent-switch-dashboard-does-not-bootstrap-after-discovery-error ()
+  (agent-switch-test--with-root root
+    (let ((captures 0))
+      (agent-switch-define-adapter failed-discovery-adapter
+        :current (lambda (_client _context)
+                   (agent-switch-test--hash "model" "live"))
+        :activate (lambda (_client _profile _context) t)
+        :capture-current (lambda (_client value _context)
+                           (setq captures (1+ captures))
+                           (agent-switch-json-copy value))
+        :discover (lambda (_client _context)
+                    (agent-switch-job-create
+                     :starter (lambda (_resolve reject)
+                                (funcall reject '(error "Discovery failed"))))))
+      (let ((client (agent-switch-register-client
+                     'failed-discovery-client
+                     :adapter 'failed-discovery-adapter)))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let ((view (agent-switch--client-view client)))
+            (should (string-match-p
+                     "Discovery failed"
+                     (agent-switch-client-view-error view)))
+            (should (= captures 0))
+            (should-not (file-exists-p
+                         (agent-switch-profile-path
+                          "failed-discovery-client" "default")))))))))
+
 (ert-deftest agent-switch-claude-patches-owned-env-only ()
   (agent-switch-test--with-root root
     (make-directory agent-switch-claude-config-directory t)
@@ -345,6 +551,31 @@
         (should (equal (agent-switch--alist-get "base_url" new-provider)
                        "https://new.test"))
         (should (equal (agent-switch--alist-get "model" config) "new/model"))))))
+
+(ert-deftest agent-switch-codex-empty-provider-roundtrips-as-current ()
+  (agent-switch-test--with-root root
+    (make-directory agent-switch-codex-home t)
+    (write-region
+     (concat "model = \"gpt-test\"\n"
+             "model_provider = \"openai\"\n\n"
+             "[model_providers.other]\n"
+             "base_url = \"https://other.test\"\n")
+     nil (agent-switch--codex-config-path))
+    (let* ((client (agent-switch-get-client "codex"))
+           (current (agent-switch--codex-current client nil))
+           (provider (gethash "provider" current))
+           (profile (agent-switch-test--profile
+                     "codex" "default"
+                     (agent-switch--capture-current client current nil)
+                     "Default")))
+      (should (hash-table-p provider))
+      (should (= (hash-table-count provider) 0))
+      (agent-switch-save-profile profile)
+      (let ((loaded (agent-switch-find-profile "codex" "default")))
+        (should (agent-switch--codex-profile-current-p
+                 client loaded current nil))
+        (agent-switch-test--run-job
+         (agent-switch-activation-job client loaded))))))
 
 (ert-deftest agent-switch-opencode-jsonc-patch-preserves-other-config ()
   (agent-switch-test--with-root root
@@ -487,11 +718,60 @@
                    prefix
                    (buffer-substring-no-properties
                     start (line-end-position))))
-          (should (eq (get-text-property start 'face) 'agent-switch-key))
+          (let ((face (get-text-property start 'face)))
+            (should (if (listp face)
+                        (memq 'agent-switch-key face)
+                      (eq face 'agent-switch-key))))
           (should (string-suffix-p
                    ")"
                    (buffer-substring-no-properties
                     start (line-end-position)))))))))
+
+(ert-deftest agent-switch-status-preamble-omits-last-operation-errors ()
+  (agent-switch-test--with-root root
+    (with-temp-buffer
+      (agent-switch-mode)
+      (let ((agent-switch--last-error "Verification failed")
+            (inhibit-read-only t))
+        (agent-switch--insert-status))
+      (should-not (string-match-p "Last operation" (buffer-string)))
+      (should-not (string-match-p "Verification failed" (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "Data: ")
+      (should (eq (get-text-property (point) 'face) 'default)))))
+
+(ert-deftest agent-switch-activation-failure-is-message-only ()
+  (agent-switch-test--with-root root
+    (agent-switch-define-adapter message-only-adapter
+      :current (lambda (_client _context) nil)
+      :activate (lambda (_client _profile _context) t))
+    (let* ((client (agent-switch-register-client
+                    'message-only-client :adapter 'message-only-adapter))
+           (profile (agent-switch-test--profile
+                     "message-only-client" "failure"
+                     (agent-switch-test--hash "model" "unused")))
+           logged)
+      (with-temp-buffer
+        (agent-switch-mode)
+        (agent-switch-refresh)
+        (cl-letf (((symbol-function 'agent-switch-state-unprotected-confirmed-p)
+                   (lambda (_adapter-id) t))
+                  ((symbol-function 'agent-switch-activation-job)
+                   (lambda (_client _profile &optional _interactivep)
+                     (agent-switch-job-create
+                      :starter
+                      (lambda (_resolve reject)
+                        (funcall reject
+                                 '(agent-switch-error
+                                   "Verification failed"))))))
+                  ((symbol-function 'message)
+                   (lambda (format-string &rest arguments)
+                     (setq logged (apply #'format format-string arguments)))))
+          (agent-switch--activate-profile client profile))
+        (should (string-match-p "Verification failed" logged))
+        (should-not (string-match-p "Last operation" (buffer-string)))
+        (should-not (string-match-p "Verification failed"
+                                    (buffer-string)))))))
 
 (ert-deftest agent-switch-dashboard-highlights-innermost-section-at-point ()
   (agent-switch-test--with-root root
@@ -562,6 +842,10 @@
   (should (eq (lookup-key agent-switch-mode-map (kbd "M-p"))
               #'agent-switch-previous-sibling-section))
   (should-not (lookup-key agent-switch-mode-map (kbd "s"))))
+
+(ert-deftest agent-switch-menu-does-not-expose-import-current ()
+  (should-error (transient-get-suffix 'agent-switch-menu "i"))
+  (should (commandp #'agent-switch-import-current)))
 
 (ert-deftest agent-switch-mode-recovers-old-nil-operation-registry ()
   (let ((original (default-value 'agent-switch--running-jobs)))

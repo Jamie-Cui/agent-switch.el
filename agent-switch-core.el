@@ -258,6 +258,34 @@ The CLIENT object is prepended to ARGUMENTS.  Return a direct value or Job."
          (callback (agent-switch-adapter-callback adapter callback-key t)))
     (apply callback client arguments)))
 
+(defun agent-switch--json-value-equal-p (left right)
+  "Return non-nil when JSON-like values LEFT and RIGHT are structurally equal."
+  (cond
+   ((hash-table-p left)
+    (and (hash-table-p right)
+         (= (hash-table-count left) (hash-table-count right))
+         (let ((equal-p t)
+               (missing (make-symbol "missing")))
+           (maphash
+            (lambda (key value)
+              (let ((other (gethash key right missing)))
+                (unless (and (not (eq other missing))
+                             (agent-switch--json-value-equal-p value other))
+                  (setq equal-p nil))))
+            left)
+           equal-p)))
+   ((vectorp left)
+    (and (vectorp right)
+         (= (length left) (length right))
+         (cl-loop for index below (length left)
+                  always (agent-switch--json-value-equal-p
+                          (aref left index) (aref right index)))))
+   ((consp left)
+    (and (consp right)
+         (agent-switch--json-value-equal-p (car left) (car right))
+         (agent-switch--json-value-equal-p (cdr left) (cdr right))))
+   (t (equal left right))))
+
 (defun agent-switch-profile-current-p (client profile current &optional context)
   "Return non-nil when PROFILE represents CLIENT CURRENT state."
   (let* ((adapter (agent-switch-get-adapter
@@ -265,7 +293,8 @@ The CLIENT object is prepended to ARGUMENTS.  Return a direct value or Job."
          (matcher (agent-switch-adapter-callback adapter :profile-current-p)))
     (if matcher
         (funcall matcher client profile current context)
-      (equal (agent-switch-profile-payload profile) current))))
+      (agent-switch--json-value-equal-p
+       (agent-switch-profile-payload profile) current))))
 
 (defun agent-switch-reset-registries ()
   "Clear all registries.

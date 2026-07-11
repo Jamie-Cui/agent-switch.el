@@ -419,11 +419,14 @@ Return nil when no provider is configured."
           (puthash "model" model payload))
         (when-let* ((small (agent-switch--alist-get "small_model" config)))
           (puthash "small-model" small payload))
-        (puthash "provider"
-                 (agent-switch--redact-json-secrets
-                  (agent-switch--toml-to-json
-                   (agent-switch--codex-provider-state config provider-id)))
-                 payload)
+        (let ((provider-state
+               (agent-switch--codex-provider-state config provider-id)))
+          (puthash "provider"
+                   (if provider-state
+                       (agent-switch--redact-json-secrets
+                        (agent-switch--toml-to-json provider-state))
+                     (make-hash-table :test #'equal))
+                   payload))
         payload))))
 
 (defun agent-switch--codex-validate (_client profile _context)

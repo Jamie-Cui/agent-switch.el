@@ -487,6 +487,11 @@ Asynchronous discovery is cached and announces completion through
                 (run-hook-with-args 'agent-switch-data-changed-hook client-id)))
              nil)))))))
 
+(defun agent-switch-profile-discovery-status (client-id)
+  "Return cached asynchronous discovery status for CLIENT-ID, or nil."
+  (setq client-id (agent-switch--string-id client-id "client"))
+  (plist-get (gethash client-id agent-switch--discovery-cache) :status))
+
 (defun agent-switch-invalidate-discovery (&optional client-id)
   "Invalidate asynchronous discovery cache for CLIENT-ID or all clients."
   (if client-id

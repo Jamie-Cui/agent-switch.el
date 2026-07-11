@@ -104,7 +104,8 @@
 
 (cl-defstruct (agent-switch-client-view
                (:constructor agent-switch--make-client-view))
-  client profiles current current-profile last-selected error loading-p)
+  client profiles current current-profile last-selected error loading-p
+  bootstrap-status)
 
 (defvar-local agent-switch--sections nil)
 (defvar-local agent-switch--visibility nil)
@@ -123,7 +124,6 @@
 (defvar-local agent-switch--watch-descriptors nil)
 (defvar-local agent-switch--watch-cleanups nil)
 (defvar-local agent-switch--watch-timer nil)
-(defvar-local agent-switch--last-error nil)
 
 (defvar-local agent-switch-profile-edit--client nil)
 (defvar-local agent-switch-profile-edit--profile nil)
@@ -286,6 +286,77 @@ Prefer the Profile named by LAST-SELECTED."
                     (error nil))))
            profiles)))))
 
+(defun agent-switch--value-has-secret-marker-p (value)
+  "Return non-nil when VALUE recursively contains a secret marker."
+  (cond
+   ((and (hash-table-p value)
+         (stringp (gethash "$secret_hash" value)))
+    t)
+   ((hash-table-p value)
+    (let (found)
+      (maphash (lambda (_key child)
+                 (when (agent-switch--value-has-secret-marker-p child)
+                   (setq found t)))
+               value)
+      found))
+   ((vectorp value)
+    (cl-some #'agent-switch--value-has-secret-marker-p (append value nil)))
+   ((consp value)
+    (cl-some #'agent-switch--value-has-secret-marker-p value))
+   (t nil)))
+
+(defun agent-switch--bootstrap-default-profile (client current)
+  "Adopt secret-safe CURRENT as CLIENT's managed Default Profile.
+Return the new Profile, `secret-required' when capture would omit a secret,
+or nil when the Adapter cannot be initialized synchronously."
+  (let* ((adapter (agent-switch-get-adapter
+                   (agent-switch-client-adapter-id client)))
+         (capture (agent-switch-adapter-callback adapter :capture-current))
+         (state (agent-switch-read-state)))
+    (cond
+     ((or (null current)
+          (null capture)
+          (agent-switch-state-record-error state))
+      nil)
+     ((agent-switch--value-has-secret-marker-p current)
+      'secret-required)
+     (t
+      (let ((payload (funcall capture client current nil)))
+        (unless (agent-switch-job-p payload)
+          (unless (hash-table-p payload)
+            (signal 'agent-switch-validation-error
+                    '("capture-current must return a Profile payload object")))
+          (let* ((profile (agent-switch--make-profile
+                           :id "default"
+                           :client-id (agent-switch-client-id client)
+                           :name "Default"
+                           :description "Captured from the initial live configuration."
+                           :payload payload
+                           :ownership 'managed
+                           :valid-p t))
+                 (validate (agent-switch-adapter-callback adapter :validate))
+                 (validation (and validate
+                                  (funcall validate client profile nil))))
+            (when (agent-switch-job-p validation)
+              (setq profile nil))
+            (when profile
+              (unless (agent-switch-profile-current-p
+                       client profile current nil)
+                (signal 'agent-switch-validation-error
+                        '("Captured Default does not match current state")))
+              (agent-switch-save-profile profile)
+              (condition-case error-value
+                  (progn
+                    (agent-switch-state-set-last-selected
+                     (agent-switch-client-id client) "default" profile)
+                    profile)
+                (error
+                 (ignore-errors
+                   (agent-switch-delete-file-optimistic
+                    (agent-switch-profile-source profile)
+                    (agent-switch-profile-source-hash profile)))
+                 (signal (car error-value) (cdr error-value))))))))))))
+
 (defun agent-switch--client-view (client)
   "Build an isolated dashboard view model for CLIENT."
   (let* ((client-id (agent-switch-client-id client))
@@ -294,6 +365,7 @@ Prefer the Profile named by LAST-SELECTED."
                           (error nil)))
          (profiles nil)
          (profile-error nil)
+         (bootstrap-status nil)
          (current-result (agent-switch--client-current client))
          (current (nth 0 current-result))
          (current-error (nth 1 current-result))
@@ -302,6 +374,36 @@ Prefer the Profile named by LAST-SELECTED."
         (setq profiles (agent-switch-profiles client-id))
       (error (setq profile-error
                    (agent-switch--safe-error-message error-value))))
+    ;; A Job may settle synchronously after the initial discovery call has
+    ;; already returned nil.  Read the ready cache once before deciding that
+    ;; the Client truly has no Profiles.
+    (when (and (null profiles)
+               (null profile-error)
+               (memq (agent-switch-profile-discovery-status client-id)
+                     '(ready error)))
+      (condition-case error-value
+          (setq profiles (agent-switch-profiles client-id))
+        (error
+         (setq profile-error
+               (agent-switch--safe-error-message error-value)))))
+    (when (and (null profiles)
+               (null profile-error)
+               (null current-error)
+               (not loading-p)
+               (not (memq (agent-switch-profile-discovery-status client-id)
+                          '(pending error))))
+      (condition-case error-value
+          (let ((result (agent-switch--bootstrap-default-profile
+                         client current)))
+            (cond
+             ((agent-switch-profile-p result)
+              (setq profiles (list result)
+                    last-selected "default"))
+             ((eq result 'secret-required)
+              (setq bootstrap-status 'secret-required))))
+        (error
+         (setq profile-error
+               (agent-switch--safe-error-message error-value)))))
     (agent-switch--make-client-view
      :client client
      :profiles profiles
@@ -310,7 +412,8 @@ Prefer the Profile named by LAST-SELECTED."
                        client profiles current last-selected)
      :last-selected last-selected
      :error (or current-error profile-error)
-     :loading-p loading-p)))
+     :loading-p loading-p
+     :bootstrap-status bootstrap-status)))
 
 (defun agent-switch--client-status (view)
   "Return propertized status string for client VIEW."
@@ -348,6 +451,8 @@ Prefer the Profile named by LAST-SELECTED."
       (propertize "loading" 'face 'shadow))
      ((agent-switch-client-view-error view)
       (propertize "error" 'face 'agent-switch-status-error))
+     ((eq (agent-switch-client-view-bootstrap-status view) 'secret-required)
+      (propertize "default setup required" 'face 'agent-switch-status-warning))
      ((and last-profile (not (agent-switch-profile-valid-p last-profile)))
       (concat (propertize "invalid profile, " 'face 'agent-switch-status-error)
               (agent-switch-profile-name last-profile)))
@@ -382,8 +487,7 @@ Prefer the Profile named by LAST-SELECTED."
   (let* ((record (agent-switch-read-state))
          (state-error (agent-switch-state-record-error record)))
     (agent-switch--insert-status-line
-     "Data" (abbreviate-file-name (agent-switch--directory))
-     'agent-switch-secondary)
+     "Data" (abbreviate-file-name (agent-switch--directory)))
     (agent-switch--insert-status-line
      "Clients" (number-to-string (length (agent-switch-clients))))
     (agent-switch--insert-status-line
@@ -392,11 +496,7 @@ Prefer the Profile named by LAST-SELECTED."
        'agent-switch-status-success))
     (when state-error
       (agent-switch--insert-status-line
-       "Error" state-error 'agent-switch-status-error))
-    (when agent-switch--last-error
-      (agent-switch--insert-status-line
-       "Last operation" agent-switch--last-error
-       'agent-switch-status-error))))
+       "Error" state-error 'agent-switch-status-error))))
 
 (defun agent-switch--insert-profile-details (client profile)
   "Insert secret-safe details for CLIENT PROFILE."
@@ -471,7 +571,12 @@ Prefer the Profile named by LAST-SELECTED."
       (if (agent-switch-client-view-profiles view)
           (dolist (profile (agent-switch-client-view-profiles view))
             (agent-switch--insert-profile-section view profile))
-        (insert (propertize "    No profiles\n" 'face 'shadow))))
+        (insert (propertize "    No profiles\n" 'face 'shadow))
+        (when (eq (agent-switch-client-view-bootstrap-status view)
+                  'secret-required)
+          (agent-switch--insert-detail-line
+           "Setup" "Use New and add secret references"
+           'agent-switch-status-warning))))
     (agent-switch--finish-section section)))
 
 (defun agent-switch--section-at-point (&optional noerror)
@@ -568,11 +673,10 @@ When KEEP-CACHE is non-nil, keep asynchronous current-state cache."
                                     client-error))))
                  (agent-switch--insert-client-section view))))))
       (error
-       (setq agent-switch--last-error
-             (agent-switch--safe-error-message error-value))
-       (insert (propertize agent-switch--last-error
-                           'face 'agent-switch-status-error)
-               "\n")))
+       (let ((message-text (agent-switch--safe-error-message error-value)))
+         (message "agent-switch: %s" message-text)
+         (insert (propertize message-text 'face 'agent-switch-status-error)
+                 "\n"))))
     (agent-switch--restore-position section-id line window-start)
     (agent-switch--update-section-highlight)))
 
@@ -740,7 +844,6 @@ Refresh immediately for direct values."
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
                (remhash client-id agent-switch--running-jobs)
-               (setq agent-switch--last-error message-text)
                (agent-switch-refresh t)))
            (message "agent-switch: %s" message-text)))))))
 
@@ -773,8 +876,7 @@ Refresh immediately for direct values."
        (lambda (_value)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (remhash client-id agent-switch--running-jobs)
-             (setq agent-switch--last-error nil)))
+             (remhash client-id agent-switch--running-jobs)))
          (agent-switch-refresh-dashboards)
          (message "Activated %s for %s"
                   (agent-switch-profile-name profile)
@@ -784,7 +886,6 @@ Refresh immediately for direct values."
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
                (remhash client-id agent-switch--running-jobs)
-               (setq agent-switch--last-error message-text)
                (agent-switch-refresh t)))
            (message "agent-switch: %s" message-text)))))))
 
@@ -1075,7 +1176,6 @@ Refresh immediately for direct values."
     ("n" "New" agent-switch-profile-new)
     ("c" "Copy" agent-switch-profile-copy)
     ("e" "Edit" agent-switch-profile-edit)
-    ("i" "Import Current" agent-switch-import-current)
     ("D" "Delete" agent-switch-profile-delete)]
    ["View"
     ("g" "Refresh" agent-switch-refresh)
