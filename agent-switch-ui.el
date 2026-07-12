@@ -276,6 +276,21 @@ Prefer the Profile named by LAST-SELECTED."
         (error
          (setq profile-error
                (agent-switch--safe-error-message error-value)))))
+    ;; Import every newly discovered native Profile before building the view.
+    ;; Imported IDs are recorded in state, so refresh and deletion do not
+    ;; recreate Profiles that have already crossed the management boundary.
+    (when (and (null profile-error)
+               (not (memq (agent-switch-profile-discovery-status client-id)
+                          '(pending error))))
+      (condition-case error-value
+          (when (agent-switch-import-discovered-profiles client current)
+            (setq profiles (agent-switch-profiles client-id)
+                  initialized-p t
+                  last-selected
+                  (agent-switch-state-last-selected client-id)))
+        (error
+         (setq profile-error
+               (agent-switch--safe-error-message error-value)))))
     (when (and (not initialized-p)
                (null profile-error)
                (not (memq (agent-switch-profile-discovery-status client-id)

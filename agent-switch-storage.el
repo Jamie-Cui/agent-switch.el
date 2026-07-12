@@ -447,6 +447,7 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
     (puthash "schema_version" agent-switch-state-schema-version object)
     (puthash "selections" (make-hash-table :test #'equal) object)
     (puthash "initialized_clients" (make-hash-table :test #'equal) object)
+    (puthash "imported_discoveries" (make-hash-table :test #'equal) object)
     (puthash "unprotected_confirmed" [] object)
     (puthash "canonical_confirmations" (make-hash-table :test #'equal) object)
     object))
@@ -558,6 +559,14 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
     (and (hash-table-p initialized)
          (eq (gethash client-id initialized) t))))
 
+(defun agent-switch-state-imported-discovery-ids (client-id)
+  "Return Adapter-discovered Profile IDs already imported for CLIENT-ID."
+  (setq client-id (agent-switch--string-id client-id "client"))
+  (let* ((data (agent-switch-state-record-data (agent-switch-read-state)))
+         (imports (gethash "imported_discoveries" data))
+         (ids (and (hash-table-p imports) (gethash client-id imports))))
+    (cl-remove-if-not #'stringp (append ids nil))))
+
 (defun agent-switch--state-put-selection (data client-id profile source)
   "Put PROFILE selection for CLIENT-ID into state DATA with SOURCE."
   (let ((selection (make-hash-table :test #'equal))
@@ -582,8 +591,9 @@ ERROR-VALUE is sanitized for display and HASH records the source content."
         data client-id profile (or source "applied"))))))
 
 (defun agent-switch-state-finish-client-initialization
-    (client-id &optional selected-profile)
+    (client-id &optional selected-profile imported-discovery-ids)
   "Mark CLIENT-ID initialized and optionally select SELECTED-PROFILE.
+IMPORTED-DISCOVERY-IDS records Adapter-discovered Profiles now under management.
 The marker survives Profile deletion so first-run capture is not repeated."
   (setq client-id (agent-switch--string-id client-id "client"))
   (agent-switch-update-state
@@ -597,6 +607,22 @@ The marker survives Profile deletion so first-run capture is not repeated."
          (signal 'agent-switch-validation-error
                  '("state initialized_clients must be an object")))
        (puthash client-id t initialized)
+       (when imported-discovery-ids
+         (let ((imports
+                (or (gethash "imported_discoveries" data)
+                    (let ((new (make-hash-table :test #'equal)))
+                      (puthash "imported_discoveries" new data)
+                      new))))
+           (unless (hash-table-p imports)
+             (signal 'agent-switch-validation-error
+                     '("state imported_discoveries must be an object")))
+           (puthash client-id
+                    (vconcat
+                     (cl-remove-duplicates
+                      (append (gethash client-id imports) nil
+                              imported-discovery-ids)
+                      :test #'equal))
+                    imports)))
        (when selected-profile
          (agent-switch--state-put-selection
           data client-id selected-profile "adopted"))))))

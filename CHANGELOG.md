@@ -31,9 +31,9 @@
   configuration as the selected managed Profile without persisting secrets.
 - Kept Adopt in the transient menu and removed the redundant Edit suffix;
   Profile editing remains available through `RET`.
-- Automatically capture a Client's initial live configuration as its managed
-  `default` Profile when it starts without Profiles, while retaining a
-  first-run marker so deliberate deletion does not recreate it.
+- Automatically import every new Adapter-discovered Profile as a managed JSON
+  Profile while retaining discovery IDs in state so refresh and deliberate
+  deletion do not recreate it; capture `default` only when discovery is empty.
 - Use random IDs for automatically captured Profiles while keeping `default`
   as the user-facing name, and render required-action markers in bold error
   styling.
@@ -62,9 +62,10 @@
   authinfo credentials for remote providers; Adopt converts legacy `env_key`
   configuration and Apply writes Codex command-backed provider authentication
   without placing the API key in Profile JSON, state, or TOML.
-- Discover every Codex `model_providers.<id>` table as a read-only Profile,
-  reusing the global model fields and converting `env_key` metadata into
-  authinfo references without reading environment variable contents.
+- Discover and automatically import every Codex `model_providers.<id>` table as
+  an editable managed Profile, reusing global model fields and converting
+  `env_key` metadata into authinfo references without reading environment
+  variable contents.
 - Represented Codex's built-in OpenAI provider semantically as `openai` and
   materialized it as `agent-switch-openai` for authinfo-managed API-key access.
   Native OAuth credentials and `~/.codex/auth.json` remain untouched and

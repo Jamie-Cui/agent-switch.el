@@ -477,6 +477,66 @@
                              (agent-switch-profiles "async-client"))
                      '("remote"))))))
 
+(ert-deftest agent-switch-dashboard-imports-all-discovered-profiles ()
+  (agent-switch-test--with-root root
+    (let* ((first
+            (agent-switch--make-profile
+             :id "first" :client-id "import-client" :name "First"
+             :payload (agent-switch-test--hash "model" "one")
+             :ownership 'external :source 'adapter :valid-p t
+             :payload-version 1))
+           (second
+            (agent-switch--make-profile
+             :id "second" :client-id "import-client" :name "Second"
+             :payload (agent-switch-test--hash "model" "two")
+             :ownership 'external :source 'adapter :valid-p t
+             :payload-version 1))
+           (third
+            (agent-switch--make-profile
+             :id "third" :client-id "import-client" :name "Third"
+             :payload (agent-switch-test--hash "model" "three")
+             :ownership 'external :source 'adapter :valid-p t
+             :payload-version 1))
+           (discovered (list first second))
+           (current (agent-switch-test--hash "model" "two")))
+      (agent-switch-define-adapter import-adapter
+        :current (lambda (_client _context) current)
+        :activate (lambda (_client _profile _context) t)
+        :discover (lambda (_client _context) discovered))
+      (let ((client (agent-switch-register-client
+                     'import-client :adapter 'import-adapter)))
+        (with-temp-buffer
+          (agent-switch-mode)
+          (let ((profiles
+                 (agent-switch-client-view-profiles
+                  (agent-switch--client-view client))))
+            (should (equal (mapcar #'agent-switch-profile-id profiles)
+                           '("first" "second")))
+            (dolist (profile profiles)
+              (should (eq (agent-switch-profile-ownership profile) 'managed))
+              (should (file-exists-p (agent-switch-profile-source profile))))
+            (should (equal (agent-switch-state-last-selected "import-client")
+                           "second"))
+            (should (equal
+                     (sort (agent-switch-state-imported-discovery-ids
+                            "import-client")
+                           #'string-lessp)
+                     '("first" "second"))))
+          (setq discovered (list first second third))
+          (let ((profiles
+                 (agent-switch-client-view-profiles
+                  (agent-switch--client-view client))))
+            (should (equal (mapcar #'agent-switch-profile-id profiles)
+                           '("first" "second" "third"))))
+          (agent-switch-delete-managed-profile
+           (agent-switch-find-profile "import-client" "first"))
+          (should (equal
+                   (mapcar
+                    #'agent-switch-profile-id
+                    (agent-switch-client-view-profiles
+                     (agent-switch--client-view client)))
+                   '("second" "third"))))))))
+
 (ert-deftest agent-switch-dashboard-initializes-live-config-only-once ()
   (agent-switch-test--with-root root
     (let ((captures 0))

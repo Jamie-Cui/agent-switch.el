@@ -74,6 +74,16 @@
              agent-switch--discovery-cache)
     (clrhash agent-switch--discovery-cache)))
 
+(defun agent-switch--unimported-discovered-profiles (client)
+  "Return Adapter-discovered Profiles not yet imported for CLIENT."
+  (let ((imported
+         (agent-switch-state-imported-discovery-ids
+          (agent-switch-client-id client))))
+    (cl-remove-if
+     (lambda (profile)
+       (member (agent-switch-profile-id profile) imported))
+     (agent-switch--adapter-discovered-profiles client))))
+
 (defun agent-switch-profiles (client-id)
   "Return all Profiles for CLIENT-ID with unique, deterministic identities."
   (let* ((client (agent-switch-get-client client-id))
@@ -94,7 +104,7 @@
                     invalid)))))
            (append (agent-switch-load-managed-profiles client-id)
                    (agent-switch-external-profiles client-id)
-                   (agent-switch--adapter-discovered-profiles client))))
+                   (agent-switch--unimported-discovered-profiles client))))
          (by-id (make-hash-table :test #'equal)))
     (dolist (profile profiles)
       (let ((id (agent-switch-profile-id profile)))
@@ -258,6 +268,71 @@ When CURRENT is nil, observe it through the Adapter.  Return a Profile or Job."
         (funcall capture client observed nil)
         (lambda (captured)
           (agent-switch-adopt-capture client name captured)))))))
+
+(defun agent-switch-import-discovered-profiles (client &optional current)
+  "Import every new Adapter-discovered Profile for CLIENT.
+Preserve each discovered Profile ID and name, and select the imported Profile
+matching CURRENT when one exists.  Return imported or pre-existing managed
+Profiles, or nil when discovery has nothing new to import."
+  (agent-switch-ensure-client-idle client)
+  (let* ((client-id (agent-switch-client-id client))
+         (candidates (agent-switch--unimported-discovered-profiles client))
+         (managed (agent-switch-load-managed-profiles client-id))
+         (adapter (agent-switch-get-adapter
+                   (agent-switch-client-adapter-id client)))
+         (payload-version (agent-switch-adapter-payload-version adapter))
+         created imported imported-ids selected)
+    (when candidates
+      (when-let* ((state-error
+                   (agent-switch-state-record-error (agent-switch-read-state))))
+        (signal 'agent-switch-validation-error
+                (list (concat "state.json is damaged; reset it before writing: "
+                              state-error))))
+      (condition-case error-value
+          (progn
+            (dolist (candidate candidates)
+              (when (condition-case nil
+                        (progn
+                          (agent-switch-validate-profile-for-client
+                           client candidate t)
+                          t)
+                      (error nil))
+                (let* ((id (agent-switch-profile-id candidate))
+                       (existing
+                        (cl-find id managed
+                                 :key #'agent-switch-profile-id :test #'equal))
+                       (profile
+                        (or existing
+                            (let ((copy (copy-agent-switch-profile candidate)))
+                              (setf (agent-switch-profile-payload copy)
+                                    (agent-switch-json-copy
+                                     (agent-switch-profile-payload candidate))
+                                    (agent-switch-profile-ownership copy) 'managed
+                                    (agent-switch-profile-source copy) nil
+                                    (agent-switch-profile-source-hash copy) nil
+                                    (agent-switch-profile-valid-p copy) t
+                                    (agent-switch-profile-payload-version copy)
+                                    payload-version)
+                              (agent-switch-save-profile copy)))))
+                  (unless existing
+                    (push profile created)
+                    (push profile managed))
+                  (push profile imported)
+                  (push id imported-ids)
+                  (when (and current (not selected)
+                             (condition-case nil
+                                 (agent-switch-profile-current-p
+                                  client profile current nil)
+                               (error nil)))
+                    (setq selected profile)))))
+            (when imported-ids
+              (agent-switch-state-finish-client-initialization
+               client-id selected imported-ids))
+            (nreverse imported))
+        (error
+         (dolist (profile created)
+           (ignore-errors (agent-switch--delete-profile-file-only profile)))
+         (signal (car error-value) (cdr error-value)))))))
 
 (defun agent-switch-bootstrap-client (client current)
   "Capture CURRENT as CLIENT's first managed `default' Profile.

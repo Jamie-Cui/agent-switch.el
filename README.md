@@ -79,14 +79,18 @@ Editing and saving never applies a Profile automatically; Apply is always
 explicit. Operation failures are logged through `message` to `*Messages*` and
 are not retained in the dashboard status preamble.
 
-On a Client's first dashboard startup, if it has live configuration but no
-managed, external, or discovered Profiles, agent-switch captures that state as
-the managed `default` Profile. This writes only agent-switch's Profile and state
-files; it does not rewrite the Client configuration. A persistent initialization
-marker prevents a deliberately emptied Client from being adopted again later.
-If no live state can be captured, the Client continues to show `No profiles`.
-`default` is the editable Profile name; Profiles created through the dashboard
-use independently generated random `p-xxxxxxxx` identifiers.
+On dashboard startup and refresh, every new Adapter-discovered Profile is
+automatically imported as an editable managed Profile while preserving its ID
+and name. Imported discovery IDs are recorded in state, so refresh does not
+duplicate them and deliberate deletion does not recreate them. Providers added
+later to a native Client config are imported on the next refresh.
+
+If a Client has no discovered or managed Profiles, agent-switch captures its
+live configuration as the managed `default` Profile. This writes only
+agent-switch's Profile and state files; it does not rewrite the Client
+configuration. If no live state can be captured, the Client continues to show
+`No profiles`. `default` is the editable Profile name and uses an independently
+generated random `p-xxxxxxxx` identifier.
 
 Delete accepts any managed Profile, including the current or selected one. The
 live Client configuration is left unchanged, and any matching selection record
@@ -115,11 +119,12 @@ name. Apply verifies that the authinfo entry exists and writes Codex's
 `model_providers.<id>.auth` command configuration. At request time, Codex runs
 the bundled batch Emacs helper, which writes only the token to standard output.
 
-Every `model_providers.<id>` table in the global Codex config is discovered as
-a read-only Profile using the global `model` and optional `small_model` values.
-Refresh the dashboard after editing `config.toml`. Discovered `env_key` values
-become command-delivered authinfo references; environment variable contents are
-never read or copied. Use Copy to create an editable managed Profile.
+Every `model_providers.<id>` table in the global Codex config is discovered and
+automatically imported as an editable managed Profile using the provider ID,
+name, global `model`, and optional `small_model` values. Refresh the dashboard
+after adding a provider to `config.toml`. Discovered `env_key` values become
+command-delivered authinfo references; environment variable contents are never
+read or copied.
 
 The semantic Profile provider ID `openai` is materialized as the private live
 provider ID `agent-switch-openai`, because Codex reserves its built-in `openai`
@@ -325,8 +330,9 @@ does not prompt, visit files, render buffers, or emit user messages:
 ```
 
 Other reusable operations are `agent-switch-create-managed-profile`,
-`agent-switch-adopt-capture`, `agent-switch-delete-managed-profile`, and
-`agent-switch-profile-ready-p` for a non-mutating readiness check.
+`agent-switch-adopt-capture`, `agent-switch-import-discovered-profiles`,
+`agent-switch-delete-managed-profile`, and `agent-switch-profile-ready-p` for a
+non-mutating readiness check.
 
 ## Elisp Extensions
 
